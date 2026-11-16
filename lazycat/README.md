@@ -19,8 +19,8 @@ a0db8caeee8d1e6cfe0aa5ce58710270f8d74a90ff4920f53a3fc22aa0956fe9
 ```sh
 cd lazycat
 lzc-cli project build
-lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.4.lpk
-lzc-cli app install ./cc.naily.mimicwx-v0.5.4.lpk
+lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.6.lpk
+lzc-cli app install ./cc.naily.mimicwx-v0.5.6.lpk
 ```
 
 Mac 使用 OrbStack 时，可为构建命令设置
@@ -65,6 +65,14 @@ lpk-manager start cc.naily.mimicwx
 无需重启微信桌面。
 仅更新接口进程时，可向 MimicWX 进程发送 SIGHUP；监督脚本会重启接口，
 保持微信桌面、X11 和当前登录不变。整个应用升级仍可能需要手机确认。
+
+热替换接口二进制时，先校验构建产物的 SHA-256、备份旧文件，再安装到
+`/usr/local/bin/mimicwx.next`。新文件必须重新设置
+`setcap cap_sys_admin+ep /usr/local/bin/mimicwx.next`，然后原子重命名为
+`/usr/local/bin/mimicwx` 并向原接口进程发送 SIGHUP。文件替换不会继承旧文件的
+capability；遗漏时 fanotify 无法启动，消息只能等待兜底轮询，发送回执可能超时。
+完成后核对微信 PID、在线状态、文件 capability、WAL 监听和 Koishi 自动重连。
+该方式更新当前容器；容器重建及应用升级仍以 LPK 内的二进制为准。
 
 Token、密钥和配置权限为 `0600`，不应上传到代码仓库或工单。
 桌面和 MimicWX 以独立 `wechat` 用户运行；初始化过程以 root 设置文件权限、

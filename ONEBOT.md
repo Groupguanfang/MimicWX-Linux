@@ -48,6 +48,7 @@ npm pack
 - `get_login_info`、`get_status`、`get_version_info`。
 - `get_friend_list`、`get_group_list`、`get_group_info`、`get_stranger_info`、`get_group_member_info`。
 - `send_private_msg`、`send_group_msg`、`send_msg`、`get_msg`。
+- `get_group_msg_history`、`get_friend_msg_history`：当前进程缓存中的最近消息，每次最多 100 条。
 - `can_send_image`、`can_send_record`；`mark_msg_as_read` 为兼容性空操作。
 
 消息支持数组和 CQ 码。文本、图片保留发送顺序，发送失败返回错误。
@@ -70,6 +71,10 @@ npm pack
 - `atuserlist` 与机器人名称提及转换为 `at` 消息段，供 Koishi 判断 @触发。
 - 去重位于协议入口，缓存及去重记录各限制 4096 条。
 - 自发消息保留在缓存中供引用查询，不再次触发 AI。
+- 数字 `real_sender_id` 通过当前消息库的 `Name2Id` 解析，优先按发送者身份判断自发消息，
+  避免自发图片的状态位被误判为群友消息。缺少发送者的群消息不向 OneBot 广播。
+- 群消息中的发送者前缀在与已解析身份一致时剔除；兼容 LF、CRLF 和旧版正文内发送者。
+- Koishi 历史拉取保留字符串会话 ID，避免将 `*@chatroom` 转成无效的数字。
 - 连接建立发送生命周期事件，每 30 秒发送真实在线状态心跳。
 - 账号目录的四位十六进制后缀从 wxid 中剔除，避免与旧用户身份及 @目标不一致。
 
@@ -81,7 +86,8 @@ npm pack
 
 出站 `reply` 和 `at` 当前降级为可读文本，不产生微信原生引用卡片或真正的 @提醒。
 引用只允许使用同一会话缓存中的消息，群聊和私聊都会校验目标会话。
-`get_msg` 只查询进程内缓存，重启后旧缓存不可用。
+`get_msg` 与历史拉取只查询进程内缓存，重启后旧缓存不可用，不读取重启前的微信历史。
+历史按会话隔离；`message_seq` 为排除该条消息的向前游标，只返回有实际消息序号的记录。
 群成员列表、撤回、群管理和语音发送尚未实现；能力接口报告不支持语音发送。
 
 入站图片和表情有可访问 HTTP(S) 地址时传递 `image` 段；

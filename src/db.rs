@@ -654,13 +654,7 @@ impl DbManager {
                             
                             let msg_type: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
                             
-                            let sender = match row.get::<_, Option<String>>(5) {
-                                Ok(s) => s.unwrap_or_default(),
-                                Err(_) => match row.get::<_, Option<Vec<u8>>>(5) {
-                                    Ok(Some(bytes)) => String::from_utf8_lossy(&bytes).to_string(),
-                                    _ => String::new(),
-                                }
-                            };
+                            let sender = message_sender(&conn, row, 5)?;
 
                             let status: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
                             
@@ -715,29 +709,9 @@ impl DbManager {
 
         let mut result = Vec::with_capacity(raw_msgs.len());
         for m in raw_msgs {
-            let mut talker = m.talker;
-            let mut content = m.content;
+            let (mut talker, content) = normalize_group_message(&m.chat, m.talker, m.content);
 
-            // 群聊中 real_sender_id 可能为空, 此时发送人 wxid 嵌入在消息内容中
-            // 格式: "wxid_xxx:\n实际消息" 或 "wxid_xxx:\r\n实际消息"
-            if talker.is_empty() && m.chat.contains("@chatroom") {
-                if let Some(pos) = content.find(":\n") {
-                    let prefix = &content[..pos];
-                    // 验证前缀看起来像 wxid (不含空格和特殊字符)
-                    if !prefix.is_empty() && !prefix.contains(' ') && prefix.len() < 50 {
-                        talker = prefix.to_string();
-                        content = content[pos + 2..].to_string(); // 跳过 ":\n"
-                    }
-                }
-            }
-
-            // 判断是否为自己发送的消息 (基于 status 位掩码)
-            // status bit 1 (0x02): 1=收到的消息, 0=自己发的消息
-            // 注意: 系统消息 (10000/10002) 的 status 可能也为 0, 需排除
-            let base_msg_type = (m.msg_type & 0xFFFF) as i32;
-            let is_self = (m.status & 0x02) == 0
-                && base_msg_type != 10000
-                && base_msg_type != 10002;
+            let is_self = message_is_self(&self.self_wxid, &talker, m.status, m.msg_type);
 
             // talker 为空时填充: 自发用 self_wxid, 私聊收到用 chat(对方)
             if talker.is_empty() {
@@ -1219,6 +1193,44 @@ fn sent_message_matches(expected_chat: &str, expected_text: &str, actual_chat: &
     expected_chat == actual_chat
         && !expected_text.trim().is_empty()
         && expected_text.trim() == actual_text.trim()
+}
+
+fn message_sender(conn: &Connection, row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Integer(sender_id) => Ok(conn.query_row(
+            "SELECT user_name FROM Name2Id WHERE rowid = ?1",
+            [sender_id],
+            |sender| sender.get::<_, String>(0),
+        ).unwrap_or_default()),
+        _ => Ok(wcdb_get_text(row, index)),
+    }
+}
+
+fn normalize_group_message(chat: &str, sender: String, content: String) -> (String, String) {
+    if chat.ends_with("@chatroom") {
+        if let Some((header, body)) = content.split_once('\n') {
+            let header = header.strip_suffix('\r').unwrap_or(header);
+            if let Some(prefix) = header.strip_suffix(':') {
+                let valid_prefix = !prefix.is_empty()
+                    && prefix.len() < 64
+                    && prefix.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+                if valid_prefix && (sender.is_empty() || sender == prefix) {
+                    return (prefix.to_string(), body.to_string());
+                }
+            }
+        }
+    }
+    (sender, content)
+}
+
+fn message_is_self(self_id: &str, sender: &str, status: i64, msg_type: i64) -> bool {
+    if matches!(msg_type & 0xFFFF, 10000 | 10002) {
+        return false;
+    }
+    if !sender.is_empty() {
+        return sender == self_id;
+    }
+    (status & 0x02) == 0
 }
 
 fn image_receipt_matches(expected_chat: &str, started_at: i64, message: &DbMessage) -> bool {

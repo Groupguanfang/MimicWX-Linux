@@ -1,10 +1,14 @@
 package: cc.naily.mimicwx
-version: "0.5.4"
+version: "0.5.6"
 name: MimicWX 微信机器人
 description: Linux 微信桌面与 MimicWX OneBot 11 接口，可接入 Koishi
 author: Naily
 license: MIT
 homepage: https://github.com/Groupguanfang/MimicWX-Linux
+locales:
+  zh-CN:
+    name: MimicWX 微信机器人
+    description: Linux 微信桌面与 MimicWX OneBot 11 接口，可接入 Koishi
 admin_only: true
 min_os_version: "1.6.0"
 permissions:

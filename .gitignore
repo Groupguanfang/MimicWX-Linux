@@ -36,3 +36,4 @@ Docs/
 /integrations/koishi/node_modules/
 /integrations/koishi/lib/
 *.lpk
+.lzc-cli-cache/

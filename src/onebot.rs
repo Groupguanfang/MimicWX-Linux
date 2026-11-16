@@ -50,6 +50,27 @@ impl MessageCache {
         }
         fresh
     }
+
+    fn history(&self, chat: &str, before: Option<i64>, limit: usize) -> Vec<Value> {
+        let mut messages = self.values.values().filter_map(|message| {
+            let sequence = message.get("message_seq")?.as_i64()?;
+            if message.get("chat_id")?.as_str()? != chat
+                || before.is_some_and(|cursor| sequence >= cursor)
+            {
+                return None;
+            }
+            Some((sequence, message))
+        }).collect::<Vec<_>>();
+        messages.sort_by_key(|(sequence, _)| *sequence);
+        messages.into_iter()
+            .rev()
+            .take(limit)
+            .map(|(_, message)| message.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
+    }
 }
 
 pub struct OneBotRuntime {
@@ -105,6 +126,10 @@ impl OneBotRuntime {
             return None;
         }
         let is_group = message.chat.ends_with("@chatroom");
+        if is_group && !message.is_self && message.talker.is_empty() {
+            warn!("忽略缺少发送者的群消息: {}", message.chat);
+            return None;
+        }
         let sender_id = if message.is_self {
             &self.self_id
         } else if is_group {
@@ -209,6 +234,24 @@ impl OneBotRuntime {
                 let id = required_id(params, "message_id")?;
                 self.messages.lock().await.values.get(&id).cloned()
                     .ok_or_else(|| format!("消息不在缓存中: {id}"))
+            }
+            "get_group_msg_history" | "get_friend_msg_history" => {
+                let group = action == "get_group_msg_history";
+                let chat = required_id(params, if group { "group_id" } else { "user_id" })?;
+                if group != chat.ends_with("@chatroom") {
+                    return Err("历史消息的会话类型与 ID 不一致".into());
+                }
+                let before = match params.get("message_seq").filter(|value| !value.is_null()) {
+                    Some(value) => Some(value.as_i64().ok_or("message_seq 必须是整数")?),
+                    None => None,
+                };
+                let limit = match params.get("count").filter(|value| !value.is_null()) {
+                    Some(value) => value.as_u64().filter(|count| *count > 0)
+                        .ok_or("count 必须是正整数")?.min(100) as usize,
+                    None => 100,
+                };
+                let messages = self.messages.lock().await.history(&chat, before, limit);
+                Ok(json!({ "messages": messages }))
             }
             "send_private_msg" => {
                 let id = required_id(params, "user_id")?;

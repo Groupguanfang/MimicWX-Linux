@@ -42,6 +42,15 @@ async fn self_messages_are_cached_without_being_dispatched() {
 }
 
 #[tokio::test]
+async fn group_messages_without_a_sender_are_not_dispatched() {
+    let runtime = OneBotRuntime::new("wxid_bot".into(), "机器人".into(), None);
+    let mut input = message("room@chatroom", "<msg><img/></msg>", 3);
+    input.talker.clear();
+    assert!(runtime.event_from_message(&input).await.is_none());
+    assert!(runtime.messages.lock().await.values.is_empty());
+}
+
+#[tokio::test]
 async fn quote_and_mention_survive_app_message_parsing() {
     let runtime = OneBotRuntime::new("wxid_bot".into(), "机器人".into(), None);
     let content = "<msg><appmsg><title><![CDATA[@机器人 这是什么]]></title><type>57</type>\
@@ -150,6 +159,37 @@ fn cache_is_bounded_and_local_ids_are_scoped_to_the_chat() {
     first.server_id = 0;
     second.server_id = 0;
     assert_ne!(message_id(&first), message_id(&second));
+}
+
+#[tokio::test]
+async fn cached_history_keeps_conversations_cursors_and_self_messages() {
+    let runtime = OneBotRuntime::new("wxid_bot".into(), "机器人".into(), None);
+    for (sequence, chat, is_self) in [
+        (1, "room@chatroom", false),
+        (2, "other@chatroom", false),
+        (3, "room@chatroom", true),
+        (4, "wxid_friend", false),
+        (5, "room@chatroom", false),
+    ] {
+        let mut input = message(chat, "缓存消息", 1);
+        input.local_id = sequence;
+        input.server_id += sequence;
+        input.is_self = is_self;
+        runtime.event_from_message(&input).await;
+    }
+    let mut cache = runtime.messages.lock().await;
+    cache.insert("quoted-only".into(), json!({
+        "chat_id": "room@chatroom", "message_id": "quoted-only",
+    }));
+    let history = cache.history("room@chatroom", Some(5), 100);
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[0]["message_seq"], 1);
+    assert_eq!(history[1]["message_seq"], 3);
+    assert_eq!(history[1]["sender"]["user_id"], "wxid_bot");
+    assert_eq!(cache.history("room@chatroom", None, 1)[0]["message_seq"], 5);
+    assert_eq!(cache.history("wxid_friend", None, 100).len(), 1);
+    assert!(cache.history("unknown@chatroom", None, 100).is_empty());
+    assert!(cache.history("room@chatroom", Some(1), 100).is_empty());
 }
 
 #[test]

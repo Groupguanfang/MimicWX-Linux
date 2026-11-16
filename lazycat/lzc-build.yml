@@ -1,4 +1,5 @@
 manifest: ./lzc-manifest.yml
+icon: ./icon.png
 pkgout: ./
 images:
   mimicwx:

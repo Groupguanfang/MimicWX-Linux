@@ -1,6 +1,6 @@
 import type { Context, h, Session, Universal } from 'koishi'
 import { Schema } from 'koishi'
-import { OneBotBot } from 'koishi-plugin-adapter-onebot'
+import { OneBot, OneBotBot } from 'koishi-plugin-adapter-onebot'
 
 export const name = 'mimicwx-onebot'
 
@@ -36,6 +36,17 @@ export class MimicWXBot extends OneBotBot<Context, MimicWXConfig> {
   override async createMessage(channelId: string, content: h.Fragment, referrer?: unknown, options?: Parameters<OneBotBot<Context>['createMessage']>[3]): Promise<Universal.Message[]> {
     if (!this.allows(channelId)) throw new Error('该会话未加入 MimicWX 允许收发列表')
     return super.createMessage(channelId, content, referrer, options)
+  }
+
+  override async getMessageList(channelId: string, before?: string, direction: Universal.Direction = 'before'): Promise<{ data: Universal.Message[] }> {
+    if (!this.allows(channelId)) throw new Error('该会话未加入 MimicWX 允许收发列表')
+    if (direction !== 'before') throw new Error('Unsupported direction.')
+    const sequence = before ? (await this.internal.getMsg(before)).message_seq : undefined
+    if (before && sequence === undefined) return { data: [] }
+    const messages = channelId.startsWith('private:')
+      ? await this.internal.getFriendMsgHistory(channelId.slice('private:'.length), sequence)
+      : (await this.internal.getGroupMsgHistory(channelId, sequence)).messages
+    return { data: await Promise.all(messages.map(message => OneBot.adaptMessage(this, message))) }
   }
 }
 

@@ -41,7 +41,33 @@ it('koishi exchanges OneBot messages in an isolated websocket sandbox', async ()
             group_id: 'sandbox@chatroom',
             sender: { user_id: 'wxid_sandbox_bot', nickname: '沙盒机器人' },
             time: 1794800000,
+            message_seq: 17,
             message: [{ type: 'text', data: { text: '被引用的原消息' } }],
+          }
+          break
+        case 'get_group_msg_history':
+          data = {
+            messages: [{
+              message_id: '9007199254740995',
+              message_type: 'group',
+              group_id: request.params.group_id,
+              sender: { user_id: 'wxid_sandbox_friend', nickname: '沙盒群友' },
+              time: 1794800000,
+              message_seq: 16,
+              message: [{ type: 'text', data: { text: '群聊缓存历史' } }],
+            }],
+          }
+          break
+        case 'get_friend_msg_history':
+          data = {
+            messages: [{
+              message_id: 'history_private',
+              message_type: 'private',
+              user_id: request.params.user_id,
+              sender: { user_id: request.params.user_id, nickname: '沙盒好友' },
+              time: 1794800000,
+              message: [{ type: 'text', data: { text: '私聊缓存历史' } }],
+            }],
           }
           break
         case 'get_group_info':
@@ -109,6 +135,15 @@ it('koishi exchanges OneBot messages in an isolated websocket sandbox', async ()
     expect(group.elements?.some(element => element.type === 'at' && element.attrs.id === bot.selfId)).toBe(true)
     expect(group.elements?.some(element => element.type === 'img' && element.attrs.src === 'https://example.test/image.png')).toBe(true)
     expect((await bot.getGuild('sandbox@chatroom')).name).toBe('沙盒测试群')
+    const history = await bot.getMessageList('sandbox@chatroom', 'quoted_sandbox')
+    expect(history.data[0].id).toBe('9007199254740995')
+    expect(history.data[0].content).toBe('群聊缓存历史')
+    expect(requests.find(request => request.action === 'get_group_msg_history')?.params).toEqual({
+      group_id: 'sandbox@chatroom',
+      message_seq: 17,
+    })
+    await expect(bot.getMessageList('forbidden@chatroom')).rejects.toThrow('允许收发列表')
+    await expect(bot.getMessageList('sandbox@chatroom', undefined, 'after')).rejects.toThrow('Unsupported direction.')
     await expect(bot.sendMessage('forbidden@chatroom', '禁止发送')).rejects.toThrow('允许收发列表')
     await expect(bot.sendPrivateMessage('wxid_forbidden', '禁止发送')).rejects.toThrow('允许收发列表')
     const forbidden = bot.session({
@@ -155,6 +190,9 @@ it('koishi exchanges OneBot messages in an isolated websocket sandbox', async ()
     }))
     await vi.waitFor(() => expect(received).toHaveLength(2))
     expect(received[1].isDirect).toBe(true)
+    const privateHistory = await bot.getMessageList('private:wxid_sandbox_friend')
+    expect(privateHistory.data[0].content).toBe('私聊缓存历史')
+    expect(requests.find(request => request.action === 'get_friend_msg_history')?.params.user_id).toBe('wxid_sandbox_friend')
     await bot.sendPrivateMessage('wxid_sandbox_friend', '私聊沙盒回复')
     expect(requests.find(request => request.action === 'send_private_msg')?.params.user_id).toBe('wxid_sandbox_friend')
   }
