@@ -19,8 +19,8 @@ a0db8caeee8d1e6cfe0aa5ce58710270f8d74a90ff4920f53a3fc22aa0956fe9
 ```sh
 cd lazycat
 lzc-cli project build
-lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.3.lpk
-lzc-cli app install ./cc.naily.mimicwx-v0.5.3.lpk
+lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.4.lpk
+lzc-cli app install ./cc.naily.mimicwx-v0.5.4.lpk
 ```
 
 Mac 使用 OrbStack 时，可为构建命令设置
