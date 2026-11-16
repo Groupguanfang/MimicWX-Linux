@@ -300,6 +300,8 @@ impl InputEngine {
             "image/gif"
         } else if image_path.ends_with(".bmp") {
             "image/bmp"
+        } else if image_path.ends_with(".webp") {
+            "image/webp"
         } else {
             "image/png" // 默认 PNG
         };

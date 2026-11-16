@@ -29,3 +29,10 @@ __pycache__/
 # Excluded directories
 Yunzai/
 Docs/
+
+/lazycat/downloads/
+/lzc-build-image-context.tar
+/Dockerfile.lzc-inline-backup-*
+/integrations/koishi/node_modules/
+/integrations/koishi/lib/
+*.lpk

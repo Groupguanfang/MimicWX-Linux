@@ -1,0 +1,18 @@
+package: cc.naily.mimicwx
+version: "0.5.0"
+name: MimicWX 微信机器人
+description: Linux 微信桌面与 MimicWX OneBot 11 接口，可接入 Koishi
+author: Naily
+license: MIT
+homepage: https://github.com/Groupguanfang/MimicWX-Linux
+admin_only: true
+min_os_version: "1.6.0"
+permissions:
+  required:
+    - net.internet
+    - compose.override
+  optional: []
+usage: |
+  从微信桌面入口扫码登录，登录完成后接口启动。
+  通过 /api/onebot/ws 接入 Koishi，使用应用的 API Token 认证。
+  使用官方微信 4.1.13.26，仅支持对应版本的数据库密钥提取。

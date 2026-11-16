@@ -14,7 +14,7 @@
 - ⌨️ **X11 XTEST 输入注入** — 通过 XTEST 扩展直接注入键鼠事件，零 Synthetic 标记，原生X11窗口管理
 - 🔑 **GDB 自动密钥提取** — 在 `setCipherKey` 偏移处设断点，用户扫码登录后自动从寄存器捕获 32 字节 AES 密钥
 - 💬 **独立聊天窗口** — 借鉴 [wxauto](https://github.com/cluic/wxauto) 的 ChatWnd 设计，支持多窗口并行收发消息
-- 🔌 **REST + WebSocket API** — 完整的 HTTP API 和 WebSocket 实时推送 (30s 心跳保活)，CORS 全开放，可对接 Yunzai 等机器人框架
+- 🔌 **OneBot 11 + REST API** — 内置 OneBot 正向 WebSocket，可接入 Koishi；保留独立 REST 接口
 - 🐳 **Docker 一键部署** — 多阶段构建 + Xvfb/VNC 虚拟桌面，开箱即用
 - 🔒 **Token 认证** — 支持 Bearer Token 认证保护 API 安全
 - 🖥️ **交互式控制台** — 支持 `/restart`、`/stop`、`/status`、`/refresh`、`/help` 命令，方向键切换历史命令
@@ -61,7 +61,7 @@
 └───────────────────────────────────────────────────────────────────────────┘
 
 ┌─ 外部对接 ────────────────────────────────────────────────────────────────┐
-│  adapter/MimicWX.js: Yunzai-Bot 适配器 (REST + WebSocket 双通道)         │
+│  Koishi OneBot 适配器 ←→ /onebot/ws ←→ MimicWX (Rust)                    │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -78,13 +78,14 @@ MimicWX-Linux/
 │   ├── wechat.rs               # 微信业务逻辑 (会话管理、消息发送/验证)
 │   ├── chatwnd.rs              # 独立聊天窗口 (ChatWnd 模式)
 │   ├── db.rs                   # 数据库监听 (SQLCipher + fanotify WAL)
-│   └── api.rs                  # HTTP/WebSocket API (axum)
+│   ├── api.rs                  # HTTP/WebSocket API (axum)
+│   ├── onebot.rs               # OneBot 11 动作、事件、鉴权与消息缓存
+│   └── onebot/                 # 媒体处理与协议单元测试
 ├── docker/
 │   ├── start.sh                # 容器启动脚本
 │   ├── extract_key.py          # GDB 密钥提取脚本
 │   └── dbus-mimicwx.conf       # D-Bus 配置 (允许 eavesdrop)
-├── adapter/
-│   └── MimicWX.js              # Yunzai-Bot 适配器
+├── lazycat/                    # 懒猫微服镜像、持久化启动脚本
 ├── Cargo.toml                  # Rust 依赖 & 构建配置
 ├── Dockerfile                  # 多阶段构建 (builder + runtime)
 ├── docker-compose.yml          # 编排配置
@@ -174,6 +175,7 @@ SQLCipher 解密微信 WCDB 数据库 + fanotify 实时监听：
 | `/listen` | DELETE | 移除监听目标 |
 | `/listen/messages` | GET | AT-SPI 监听消息 |
 | `/ws` | GET | WebSocket 实时消息推送 |
+| `/onebot/ws` | GET | OneBot 11 通用 WebSocket（独立鉴权） |
 | `/debug/tree` | GET | AT-SPI2 控件树 (调试) |
 | `/debug/session_tree` | GET | 会话容器树 (调试) |
 
@@ -249,21 +251,11 @@ auto = ["文件传输助手", "好友A", "工作群"]
 
 ---
 
-## 🔧 对接 Yunzai-Bot
+## 🔧 通过 OneBot 11 接入 Koishi
 
-项目内置 Yunzai-Bot v3 适配器 (`adapter/MimicWX.js`)，支持：
-
-- REST API + WebSocket 双通道通信
-- 自动解析数据库消息 (文本/图片/语音/视频/表情/链接)
-- 智能消息分段发送 (文本 + 图片分离)
-- 私聊/群聊消息路由
-- 好友/群列表自动同步
-
-```bash
-# 环境变量
-export MIMICWX_URL="http://localhost:8899"      # API 地址
-export MIMICWX_TOKEN="your-secret-token"         # 认证 Token
-```
+本 fork 将 OneBot 服务直接实现在 Rust 后端，已移除云崽专用适配器。
+启用 `[onebot]` 后，用正向 WebSocket 连接 `/onebot/ws`。
+配置、微信 ID 扩展、迁入的兼容修复、能力限制和测试方法见 [ONEBOT.md](ONEBOT.md)。
 
 ---
 

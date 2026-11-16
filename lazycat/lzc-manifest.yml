@@ -1,0 +1,34 @@
+application:
+  subdomain: mimicwx
+  multi_instance: false
+  public_path:
+    - /api/onebot/ws
+  routes:
+    - /api/=http://mimicwx:8899/
+    - /=http://mimicwx:6080/
+  entries:
+    - id: desktop
+      title: 微信桌面
+      path: /vnc.html?autoconnect=1&resize=remote&reconnect=1
+    - id: status
+      title: 接口状态（登录后）
+      path: /api/status
+services:
+  mimicwx:
+    image: embed:mimicwx
+    environment:
+      TZ: Asia/Shanghai
+    binds:
+      - /lzcapp/var/wechat:/home/wechat/.xwechat
+      - /lzcapp/var/wechat-files:/home/wechat/xwechat_files
+      - /lzcapp/var/config:/home/wechat/mimicwx-linux
+      - /lzcapp/var/state:/var/lib/mimicwx
+    shm_size: 512m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pgrep -x wechat >/dev/null && curl --fail --silent http://127.0.0.1:6080/vnc.html >/dev/null
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s

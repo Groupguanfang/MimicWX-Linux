@@ -50,6 +50,8 @@ pub struct AppState {
     pub db: Option<Arc<DbManager>>,
     /// API 认证 Token (None = 不启用认证)
     pub api_token: Option<String>,
+    /// OneBot 11 运行时 (启用时存在)
+    pub onebot: Option<Arc<crate::onebot::OneBotRuntime>>,
     /// 启动时间 (用于 uptime 计算)
     pub start_time: std::time::Instant,
 }
@@ -256,9 +258,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     // 免认证路由
-    Router::new()
-        .route("/status", get(get_status))
-        .merge(protected)
+    let router = Router::new().route("/status", get(get_status)).merge(protected);
+
+    // OneBot 11 使用独立 Bearer Token 校验；该路径可由懒猫 public_path 放行。
+    let router = if state.onebot.is_some() {
+        router.route(crate::onebot::WS_PATH, get(crate::onebot::ws_handler))
+    } else {
+        router
+    };
+
+    router
         .layer(tower_http::cors::CorsLayer::permissive()) // ⑩ CORS 支持
         .with_state(state)
 }
@@ -298,10 +307,10 @@ fn default_image_name() -> String {
 }
 
 #[derive(Serialize)]
-struct SendResponse {
-    sent: bool,
-    verified: bool,
-    message: String,
+pub struct SendResponse {
+    pub sent: bool,
+    pub verified: bool,
+    pub message: String,
 }
 
 #[derive(Deserialize)]
@@ -372,10 +381,11 @@ async fn get_new_messages(State(state): State<Arc<AppState>>) -> impl IntoRespon
     Json(serde_json::to_value(msgs).unwrap_or_default())
 }
 
-async fn send_message(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SendRequest>,
-) -> Result<Json<SendResponse>, ApiError> {
+pub async fn send_text(
+    state: &Arc<AppState>,
+    to: &str,
+    text: &str,
+) -> Result<SendResponse, String> {
     // DB 可用时跳过 AT-SPI 验证, 由下面的 DB 验证替代
     let has_db = state.db.is_some();
 
@@ -385,18 +395,18 @@ async fn send_message(
     // 发送命令到 actor
     let (reply_tx, reply_rx) = oneshot::channel();
     state.input_tx.send(InputCommand::SendMessage {
-        to: req.to.clone(),
-        text: req.text.clone(),
+        to: to.to_string(),
+        text: text.to_string(),
         skip_verify: has_db,
         reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    }).await.map_err(|_| "InputEngine actor 已停止".to_string())?;
 
     match reply_rx.await {
         Ok(Ok((sent, atspi_verified, message))) => {
             // DB 验证 (优先): DB 可用时用已订阅的 receiver 等待匹配
             let verified = if let Some(rx) = sent_rx {
                 state.db.as_ref().unwrap()
-                    .verify_sent(&req.text, rx).await
+                    .verify_sent(text, rx).await
                     .unwrap_or(atspi_verified)
             } else {
                 atspi_verified
@@ -404,64 +414,75 @@ async fn send_message(
 
             let msg_json = serde_json::json!({
                 "type": "sent",
-                "to": req.to,
-                "text": req.text,
+                "to": to,
+                "text": text,
                 "verified": verified,
             });
             let _ = state.tx.send(msg_json.to_string());
-            Ok(Json(SendResponse { sent, verified, message }))
+            Ok(SendResponse { sent, verified, message })
         }
-        Ok(Err(e)) => Err(ApiError::internal(format!("发送失败: {e}"))),
-        Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
+        Ok(Err(e)) => Err(format!("发送失败: {e}")),
+        Err(_) => Err("actor 响应通道已关闭".to_string()),
     }
+}
+
+async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SendRequest>,
+) -> Result<Json<SendResponse>, ApiError> {
+    send_text(&state, &req.to, &req.text)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
 }
 
 async fn send_image(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SendImageRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
-    use std::io::Write;
-
-    // 解码 base64 图片
     use base64::Engine;
     let image_data = base64::engine::general_purpose::STANDARD
         .decode(&req.file)
         .map_err(|e| ApiError::internal(format!("base64 解码失败: {e}")))?;
+    send_image_bytes(&state, &req.to, image_data)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
 
-    // 保存到临时文件
-    let ext = if req.name.contains('.') {
-        req.name.rsplit('.').next().unwrap_or("png")
-    } else {
-        "png"
-    };
-    let tmp_path = format!("/tmp/mimicwx_img_{}_{:04x}.{}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis(),
-        rand_u16(), ext);
-    {
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| ApiError::internal(format!("创建临时文件失败: {e}")))?;
-        f.write_all(&image_data)
-            .map_err(|e| ApiError::internal(format!("写入图片失败: {e}")))?;
-    }
-
-    // 发送命令到 actor
+pub async fn send_image_bytes(
+    state: &Arc<AppState>,
+    to: &str,
+    image_data: Vec<u8>,
+) -> Result<SendResponse, String> {
+    let ext = if image_data.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else if image_data.starts_with(b"GIF8") {
+        "gif"
+    } else if image_data.starts_with(b"BM") {
+        "bmp"
+    } else if image_data.starts_with(b"RIFF") {
+        "webp"
+    } else { "png" };
+    let tmp_path = format!("/tmp/mimicwx_img_{}_{:04x}.{ext}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
+        rand_u16());
+    tokio::fs::write(&tmp_path, image_data).await
+        .map_err(|error| format!("写入图片失败: {error}"))?;
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::SendImage {
-        to: req.to.clone(),
+    let queued = state.input_tx.send(InputCommand::SendImage {
+        to: to.to_string(),
         image_path: tmp_path.clone(),
         reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
-
-    let result = reply_rx.await;
-
-    // 清理临时文件
-    let _ = std::fs::remove_file(&tmp_path);
-
-    match result {
-        Ok(Ok((sent, verified, message))) => Ok(Json(SendResponse { sent, verified, message })),
-        Ok(Err(e)) => Err(ApiError::internal(format!("发送图片失败: {e}"))),
-        Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
-    }
+    }).await;
+    let result = if queued.is_ok() {
+        reply_rx.await.map_err(|_| "actor 响应通道已关闭".to_string())
+            .and_then(|response| response.map_err(|error| format!("发送图片失败: {error}")))
+    } else {
+        Err("InputEngine actor 已停止".to_string())
+    };
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+    result.map(|(sent, verified, message)| SendResponse { sent, verified, message })
 }
 
 async fn get_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {

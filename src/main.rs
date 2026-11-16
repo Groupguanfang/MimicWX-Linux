@@ -13,6 +13,7 @@ mod api;
 mod chatwnd;
 mod db;
 mod input;
+mod onebot;
 mod wechat;
 
 use anyhow::Result;
@@ -32,6 +33,8 @@ struct AppConfig {
     api: ApiConfig,
     #[serde(default)]
     listen: ListenConfig,
+    #[serde(default)]
+    onebot: OneBotConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -46,6 +49,16 @@ struct ListenConfig {
     /// 启动后自动弹出独立窗口并监听的对象
     #[serde(default)]
     auto: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct OneBotConfig {
+    /// 是否启用 OneBot 11 WebSocket 服务
+    #[serde(default)]
+    enabled: bool,
+    /// OneBot 鉴权 Token；留空时复用 [api].token
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// 加载配置文件 (搜索多个路径)
@@ -160,7 +173,10 @@ async fn main() -> Result<()> {
     // ⑥ 读取 GDB 提取的数据库密钥 + 初始化 DbManager
     let key_path = "/tmp/wechat_key.txt";
     for i in 0..10 {
-        if std::path::Path::new(key_path).exists() {
+        if std::fs::read_to_string(key_path)
+            .map(|key| key.trim().len() == 64)
+            .unwrap_or(false)
+        {
             break;
         }
         if i == 0 {
@@ -173,7 +189,7 @@ async fn main() -> Result<()> {
         Ok(key) => {
             let key = key.trim().to_string();
             if key.len() == 64 {
-                info!("🔑 数据库密钥已获取 ({}...{})", &key[..8], &key[56..]);
+                info!("🔑 数据库密钥已获取");
 
                 // 查找数据库目录
                 let db_dir = find_db_dir();
@@ -218,6 +234,26 @@ async fn main() -> Result<()> {
     // ⑦ 广播通道 (WebSocket)
     let (tx, _) = tokio::sync::broadcast::channel::<String>(128);
 
+    let api_token = config.api.token.filter(|token| !token.is_empty());
+    let onebot_runtime = if config.onebot.enabled {
+        let token = config.onebot.token.filter(|token| !token.is_empty()).or(api_token.clone());
+        match db_manager.as_ref() {
+            Some(db) if token.is_some() && db.self_wxid().starts_with("wxid_") => {
+                Some(onebot::OneBotRuntime::new(
+                    db.self_wxid().to_string(),
+                    db.self_display_name().await,
+                    token,
+                ))
+            }
+            _ => {
+                warn!("OneBot 暂未启用：请配置 Token，并在登录微信、数据库就绪后重启 MimicWX");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // ⑧ InputEngine Actor + API 服务
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<api::InputCommand>(32);
 
@@ -234,7 +270,8 @@ async fn main() -> Result<()> {
         input_tx: input_tx.clone(),
         tx: tx.clone(),
         db: db_manager.clone(),
-        api_token: config.api.token.filter(|t| !t.is_empty()),
+        api_token,
+        onebot: onebot_runtime.clone(),
         start_time: std::time::Instant::now(),
     });
 
@@ -243,6 +280,9 @@ async fn main() -> Result<()> {
     info!("🌐 API 服务启动: http://{addr}");
     info!("📡 WebSocket: ws://{addr}/ws");
     info!("📌 端点: /status, /contacts, /sessions, /messages/new, /send, /chat, /listen, /ws");
+    if onebot_runtime.is_some() {
+        info!("🤖 OneBot 11: ws://{addr}{}", onebot::WS_PATH);
+    }
     if state.api_token.is_some() {
         info!("🔒 API 认证已启用 (Bearer Token)");
     } else {
@@ -305,6 +345,7 @@ async fn main() -> Result<()> {
     // ⑨ 后台数据库消息监听任务
     if let Some(db) = db_manager {
         let listen_tx = tx.clone();
+        let listen_onebot = onebot_runtime.clone();
 
         // ⑨-a) 联系人定时刷新 (每 5 分钟, 新好友/群不用重启就有名字)
         {
@@ -362,6 +403,11 @@ async fn main() -> Result<()> {
                                 "is_self": m.is_self,
                             });
                             let _ = listen_tx.send(json.to_string());
+                            if let Some(onebot) = &listen_onebot {
+                                if let Some(event) = onebot.event_from_message(m).await {
+                                    let _ = onebot.events.send(event.to_string());
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -480,11 +526,14 @@ fn find_db_dir() -> Option<PathBuf> {
     // 收集所有可能的 xwechat_files 路径 (用 HashSet 去重)
     let mut search_dirs = std::collections::HashSet::new();
     search_dirs.insert(PathBuf::from("/home/wechat/Documents/xwechat_files"));
+    search_dirs.insert(PathBuf::from("/home/wechat/xwechat_files"));
     search_dirs.insert(dirs_or_home().join("Documents/xwechat_files"));
+    search_dirs.insert(dirs_or_home().join("xwechat_files"));
     // Fallback: 扫描 /home 下所有用户
     if let Ok(homes) = std::fs::read_dir("/home") {
-        for h in homes.flatten() {
-            search_dirs.insert(h.path().join("Documents/xwechat_files"));
+        for home_entry in homes.flatten() {
+            search_dirs.insert(home_entry.path().join("Documents/xwechat_files"));
+            search_dirs.insert(home_entry.path().join("xwechat_files"));
         }
     }
 

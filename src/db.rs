@@ -247,16 +247,7 @@ impl DbManager {
         let self_wxid = db_dir.components()
             .filter_map(|c| c.as_os_str().to_str())
             .find(|s| s.starts_with("wxid_"))
-            .map(|s| {
-                // 取 wxid_xxx 部分 (去掉 _c024 后缀)
-                if let Some(pos) = s.rfind("_c") {
-                    let suffix = &s[pos+2..];
-                    if suffix.chars().all(|c| c.is_ascii_digit()) {
-                        return s[..pos].to_string();
-                    }
-                }
-                s.to_string()
-            })
+            .map(|directory| account_wxid(directory).to_string())
             .unwrap_or_default();
         if !self_wxid.is_empty() {
             info!("👤 当前账号: {}", self_wxid);
@@ -508,6 +499,21 @@ impl DbManager {
     /// 获取联系人列表
     pub async fn get_contacts(&self) -> Vec<ContactInfo> {
         self.contacts.lock().await.values().cloned().collect()
+    }
+
+    /// 当前登录账号的 wxid
+    pub fn self_wxid(&self) -> &str {
+        &self.self_wxid
+    }
+
+    /// 当前登录账号的显示名
+    pub async fn self_display_name(&self) -> String {
+        self.self_display_name.read().await.clone()
+    }
+
+    /// 通过 username 获取联系人/群聊显示名
+    pub async fn display_name(&self, username: &str) -> String {
+        self.resolve_name(username).await
     }
 
     /// 通过 username 获取显示名
@@ -1152,9 +1158,26 @@ fn build_single_table_meta(conn: &Connection, table: &str) -> Option<TableMeta> 
     })
 }
 
+fn account_wxid(directory: &str) -> &str {
+    let Some((username, suffix)) = directory.rsplit_once('_') else {
+        return directory;
+    };
+    let is_hash = suffix.len() == 4 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let is_legacy = suffix.strip_prefix('c')
+        .is_some_and(|digits| !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()));
+    if username.starts_with("wxid_") && (is_hash || is_legacy) {
+        username
+    } else {
+        directory
+    }
+}
+
+#[cfg(test)]
+mod tests;
+
 /// 根据 msg_type 解析原始 content 为结构化 MsgContent
 /// content 已经过 Zstd 解压 (如果需要), 应为 XML 或纯文本
-fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
+pub(crate) fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
     // 微信 msg_type 高位是标志位 (如 0x600000021), 实际类型在低 16 位
     let base_type = (msg_type & 0xFFFF) as i32;
     match base_type {

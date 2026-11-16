@@ -1,0 +1,15 @@
+manifest: ./lzc-manifest.yml
+pkgout: ./
+images:
+  mimicwx:
+    builder: local
+    dockerfile: ./Dockerfile
+    context: ../
+compose_override:
+  services:
+    mimicwx:
+      runtime: runc
+      init: true
+      cap_add:
+        - SYS_ADMIN
+        - SYS_PTRACE
