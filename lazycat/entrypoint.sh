@@ -1,13 +1,14 @@
 #!/bin/bash
 set -euo pipefail
 
-install -d -o wechat -g wechat -m 0700 \
+install -d -o wechat -g wechat -m 0700 /home/wechat \
     /home/wechat/.xwechat /home/wechat/xwechat_files \
     /home/wechat/mimicwx-linux /var/lib/mimicwx
 install -d -m 0755 /run/dbus
 install -d -m 1777 /tmp/.X11-unix
 chown wechat:wechat /home/wechat/.xwechat /home/wechat/xwechat_files \
     /home/wechat/mimicwx-linux /var/lib/mimicwx
+/usr/local/bin/mimicwx-profile
 
 if [ ! -s /var/lib/mimicwx/api-token ]; then
     umask 077

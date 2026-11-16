@@ -19,6 +19,7 @@ services:
     environment:
       TZ: Asia/Shanghai
     binds:
+      - /lzcapp/var/state/profile:/home/wechat
       - /lzcapp/var/wechat:/home/wechat/.xwechat
       - /lzcapp/var/wechat-files:/home/wechat/xwechat_files
       - /lzcapp/var/config:/home/wechat/mimicwx-linux

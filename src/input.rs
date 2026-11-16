@@ -169,13 +169,15 @@ impl InputEngine {
     // =================================================================
 
     fn raw_key_press(&self, keycode: Keycode) -> Result<()> {
-        self.conn.xtest_fake_input(KEY_PRESS, keycode, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(KEY_PRESS, keycode, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST key press was rejected")?;
         self.conn.flush()?;
         Ok(())
     }
 
     fn raw_key_release(&self, keycode: Keycode) -> Result<()> {
-        self.conn.xtest_fake_input(KEY_RELEASE, keycode, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(KEY_RELEASE, keycode, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST key release was rejected")?;
         self.conn.flush()?;
         Ok(())
     }
@@ -332,7 +334,8 @@ impl InputEngine {
 
     /// 鼠标移动到绝对坐标
     pub async fn move_mouse(&mut self, x: i32, y: i32) -> Result<()> {
-        self.conn.xtest_fake_input(MOTION_NOTIFY, 0, 0, self.screen_root, x as i16, y as i16, 0)?;
+        self.conn.xtest_fake_input(MOTION_NOTIFY, 0, 0, self.screen_root, x as i16, y as i16, 0)?
+            .check().context("XTEST pointer motion was rejected")?;
         self.conn.flush()?;
         debug!("🖱️ move_mouse: ({x}, {y})");
         Ok(())
@@ -344,12 +347,14 @@ impl InputEngine {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // 按下左键
-        self.conn.xtest_fake_input(BUTTON_PRESS, 1, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(BUTTON_PRESS, 1, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST button press was rejected")?;
         self.conn.flush()?;
         tokio::time::sleep(std::time::Duration::from_millis(CLICK_HOLD_MS)).await;
 
         // 释放左键
-        self.conn.xtest_fake_input(BUTTON_RELEASE, 1, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(BUTTON_RELEASE, 1, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST button release was rejected")?;
         self.conn.flush()?;
 
         debug!("🖱️ click: ({x}, {y})");
@@ -369,11 +374,13 @@ impl InputEngine {
         self.move_mouse(x, y).await?;
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        self.conn.xtest_fake_input(BUTTON_PRESS, 3, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(BUTTON_PRESS, 3, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST button press was rejected")?;
         self.conn.flush()?;
         tokio::time::sleep(std::time::Duration::from_millis(CLICK_HOLD_MS)).await;
 
-        self.conn.xtest_fake_input(BUTTON_RELEASE, 3, 0, self.screen_root, 0, 0, 0)?;
+        self.conn.xtest_fake_input(BUTTON_RELEASE, 3, 0, self.screen_root, 0, 0, 0)?
+            .check().context("XTEST button release was rejected")?;
         self.conn.flush()?;
 
         debug!("🖱️ right_click: ({x}, {y})");
@@ -389,8 +396,10 @@ impl InputEngine {
 
         let button: u8 = if clicks > 0 { 4 } else { 5 };
         for _ in 0..clicks.unsigned_abs() {
-            self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.screen_root, 0, 0, 0)?;
-            self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.screen_root, 0, 0, 0)?;
+            self.conn.xtest_fake_input(BUTTON_PRESS, button, 0, self.screen_root, 0, 0, 0)?
+                .check().context("XTEST scroll button press was rejected")?;
+            self.conn.xtest_fake_input(BUTTON_RELEASE, button, 0, self.screen_root, 0, 0, 0)?
+                .check().context("XTEST scroll button release was rejected")?;
             self.conn.flush()?;
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

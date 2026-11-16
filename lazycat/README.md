@@ -19,8 +19,8 @@ a0db8caeee8d1e6cfe0aa5ce58710270f8d74a90ff4920f53a3fc22aa0956fe9
 ```sh
 cd lazycat
 lzc-cli project build
-lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.0.lpk
-lzc-cli app install ./cc.naily.mimicwx-v0.5.0.lpk
+lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.1.lpk
+lzc-cli app install ./cc.naily.mimicwx-v0.5.1.lpk
 ```
 
 Mac 使用 OrbStack 时，可为构建命令设置
@@ -52,6 +52,17 @@ lpk-manager start cc.naily.mimicwx
 - `wechat-files`：新版微信数据库和媒体。
 - `config`：MimicWX 配置。
 - `state`：Token、数据库密钥和密钥提取日志。
+- `state/profile`：微信用户目录，包括 `.sys1og.conf`、用户设置及网页组件资料；原有数据库和账号目录继续使用各自的挂载。
+- `state/machine-id`：本实例固定的 D-Bus 与系统设备标识，在启动 D-Bus、微信之前恢复。
+
+从 0.5.0 升级前，在旧容器仍运行时执行 `lazycat/profile.sh --snapshot`，
+把当前用户目录与设备标识保存到原有的持久 `state` 目录，再安装 0.5.1。
+脚本不打印凭据，不复制数据库、媒体或运行中的 D-Bus 缓存；重复执行会保留已有设备标识。
+首次使用新挂载前务必完成快照，避免容器替换丢失尚在临时层中的配置。
+
+登录资料和设备标识持久化能避免容器重建引入新的本地环境，不能替代微信服务端的登录验证。
+是否可自动登录仍取决于客户端设置及微信的验证结果。日常调整 Koishi 只重启 Koishi 应用，
+无需重启微信桌面。
 
 Token、密钥和配置权限为 `0600`，不应上传到代码仓库或工单。
 桌面和 MimicWX 以独立 `wechat` 用户运行；初始化过程以 root 设置文件权限、

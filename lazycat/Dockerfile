@@ -58,11 +58,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /build/mimicwx /usr/local/bin/mimicwx
 COPY docker/dbus-mimicwx.conf /etc/dbus-1/session.d/mimicwx.conf
 COPY lazycat/extract-key.py /usr/local/bin/extract-key.py
+COPY lazycat/profile.sh /usr/local/bin/mimicwx-profile
 COPY lazycat/entrypoint.sh /usr/local/bin/mimicwx-entrypoint
 COPY lazycat/session.sh /usr/local/bin/mimicwx-session
 COPY lazycat/index.html /usr/share/novnc/index.html
 RUN chmod 0755 /usr/local/bin/mimicwx /usr/local/bin/mimicwx-entrypoint \
-    /usr/local/bin/mimicwx-session \
+    /usr/local/bin/mimicwx-session /usr/local/bin/mimicwx-profile \
     && setcap cap_sys_admin+ep /usr/local/bin/mimicwx \
     && install -d -o wechat -g wechat -m 0700 \
     /home/wechat/.xwechat /home/wechat/mimicwx-linux /var/lib/mimicwx
