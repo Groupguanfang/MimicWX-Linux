@@ -19,8 +19,8 @@ a0db8caeee8d1e6cfe0aa5ce58710270f8d74a90ff4920f53a3fc22aa0956fe9
 ```sh
 cd lazycat
 lzc-cli project build
-lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.2.lpk
-lzc-cli app install ./cc.naily.mimicwx-v0.5.2.lpk
+lzc-cli lpk lint ./cc.naily.mimicwx-v0.5.3.lpk
+lzc-cli app install ./cc.naily.mimicwx-v0.5.3.lpk
 ```
 
 Mac 使用 OrbStack 时，可为构建命令设置
@@ -63,6 +63,8 @@ lpk-manager start cc.naily.mimicwx
 登录资料和设备标识持久化能避免容器重建引入新的本地环境，不能替代微信服务端的登录验证。
 是否可自动登录仍取决于客户端设置及微信的验证结果。日常调整 Koishi 只重启 Koishi 应用，
 无需重启微信桌面。
+仅更新接口进程时，可向 MimicWX 进程发送 SIGHUP；监督脚本会重启接口，
+保持微信桌面、X11 和当前登录不变。整个应用升级仍可能需要手机确认。
 
 Token、密钥和配置权限为 `0600`，不应上传到代码仓库或工单。
 桌面和 MimicWX 以独立 `wechat` 用户运行；初始化过程以 root 设置文件权限、

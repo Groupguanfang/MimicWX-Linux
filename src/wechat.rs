@@ -17,6 +17,11 @@ use crate::atspi::{AtSpi, NodeRef, SearchAction, is_structural_role};
 use crate::chatwnd::ChatWnd;
 use crate::input::InputEngine;
 
+const STATE_EDITABLE: u64 = 1 << 7;
+const STATE_FOCUSED: u64 = 1 << 12;
+const STATE_MODAL: u64 = 1 << 16;
+const STATE_SHOWING: u64 = 1 << 25;
+
 // =====================================================================
 // 状态
 // =====================================================================
@@ -224,18 +229,25 @@ impl WeChat {
     async fn find_chat_edit_box(&self, app: &NodeRef, who: &str) -> Option<NodeRef> {
         let mut pending = vec![(app.clone(), 0u32)];
         let mut visited = 0;
+        let mut editor = None;
         while let Some((node, depth)) = pending.pop() {
             visited += 1;
             if visited > 750 {
                 return None;
             }
             let role = self.atspi.role(&node).await;
-            if depth > 1 && self.atspi.get_states(&node).await & (1 << 25) == 0 {
+            let states = self.atspi.get_states(&node).await;
+            if depth > 1 && states & STATE_SHOWING == 0 {
                 continue;
             }
+            if states & STATE_SHOWING != 0
+                && (role == "dialog" || states & STATE_MODAL != 0)
+            {
+                return None;
+            }
             if role == "entry" || role == "text" {
-                if self.atspi.name(&node).await.trim() == who {
-                    return Some(node);
+                if states & STATE_EDITABLE != 0 && self.atspi.name(&node).await.trim() == who {
+                    editor = Some(node);
                 }
                 continue;
             }
@@ -249,7 +261,7 @@ impl WeChat {
                 }
             }
         }
-        None
+        editor
     }
 
     /// 在会话容器中按名称查找联系人 (BFS 穿透 filler 层级)
@@ -431,10 +443,6 @@ impl WeChat {
         // 选择第一个搜索结果 (Enter)
         engine.press_enter().await?;
         tokio::time::sleep(ms(800)).await;
-
-        // Esc 关闭搜索框 (借鉴 wxauto _refresh)
-        engine.press_key("Escape").await?;
-        tokio::time::sleep(ms(500)).await;
 
         // 验证是否切换成功
         if let Some(editor) = self.find_chat_edit_box(&app, who).await {
@@ -780,10 +788,23 @@ impl WeChat {
         if !self.atspi.grab_focus(&editor).await {
             anyhow::bail!("无法聚焦目标会话输入框: {to}");
         }
+        if !self.atspi.text(&editor).await
+            .map(|contents| contents.trim_end_matches('\n').is_empty())
+            .unwrap_or(false)
+        {
+            anyhow::bail!("目标会话输入框已有草稿或无法读取，已取消发送: {to}");
+        }
 
         // 3. 粘贴消息 (xclip + Ctrl+V)
         engine.paste_text(text).await?;
         tokio::time::sleep(ms(300)).await;
+
+        let editor = self.find_chat_edit_box(&app, to).await
+            .ok_or_else(|| anyhow::anyhow!("粘贴后目标会话改变或出现弹窗，已取消发送: {to}"))?;
+        let contents = self.atspi.text(&editor).await;
+        if !message_input_ready(self.atspi.get_states(&editor).await, contents.as_deref(), text) {
+            anyhow::bail!("未确认目标输入框的焦点及完整内容，已取消发送: {to}");
+        }
 
         // 4. Enter 发送
         engine.press_enter().await?;
@@ -880,9 +901,31 @@ fn session_name_matches(item_name: &str, target: &str) -> bool {
     item_name.lines().next().map(str::trim) == Some(target)
 }
 
+fn message_input_ready(states: u64, contents: Option<&str>, expected: &str) -> bool {
+    let required = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
+    let Some(contents) = contents else {
+        return false;
+    };
+    let actual = contents.replace("\r\n", "\n");
+    let expected = expected.replace("\r\n", "\n");
+    states & required == required
+        && !expected.trim().is_empty()
+        && actual.trim_end_matches('\n') == expected.trim_end_matches('\n')
+}
+
 #[cfg(test)]
 mod tests {
-    use super::session_name_matches;
+    use super::{message_input_ready, session_name_matches, STATE_EDITABLE, STATE_FOCUSED, STATE_SHOWING};
+
+    #[test]
+    fn submission_requires_focus_and_the_complete_pasted_message() {
+        let ready = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
+        assert!(message_input_ready(ready, Some("完整内容\n第二行\n"), "完整内容\r\n第二行"));
+        assert!(!message_input_ready(ready, Some("旧草稿完整内容"), "完整内容"));
+        assert!(!message_input_ready(ready & !STATE_FOCUSED, Some("完整内容"), "完整内容"));
+        assert!(!message_input_ready(ready, None, "完整内容"));
+        assert!(!message_input_ready(ready, Some(""), ""));
+    }
 
     #[test]
     fn session_selection_ignores_message_previews_and_partial_names() {

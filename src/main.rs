@@ -492,6 +492,10 @@ async fn main() -> Result<()> {
 
     // 优雅退出: 监听 shutdown 信号 + Ctrl+C
     let mut shutdown_rx = shutdown_tx_clone.subscribe();
+    let mut restart_signal = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::hangup(),
+    )?;
+    let restart_exit_code = exit_code.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             // 等待 shutdown 信号或 Ctrl+C
@@ -501,6 +505,10 @@ async fn main() -> Result<()> {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("🛑 收到 Ctrl+C, 停止服务...");
+                }
+                _ = restart_signal.recv() => {
+                    restart_exit_code.store(42, Ordering::Relaxed);
+                    info!("🔄 收到 SIGHUP，仅重启 MimicWX 接口服务...");
                 }
             }
         })
