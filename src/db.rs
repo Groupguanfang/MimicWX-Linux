@@ -230,7 +230,7 @@ pub struct DbManager {
     /// WAL 变化广播通知 (多消费者: 消息循环 + verify_sent 等)
     wal_notify: tokio::sync::broadcast::Sender<()>,
     /// 自发消息内容广播 (get_new_messages 检测到自发消息时发出)
-    sent_content_tx: tokio::sync::broadcast::Sender<String>,
+    sent_content_tx: tokio::sync::broadcast::Sender<(String, String)>,
 }
 
 impl DbManager {
@@ -282,7 +282,7 @@ impl DbManager {
         }
 
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
-        let (sent_tx, _) = tokio::sync::broadcast::channel::<String>(32);
+        let (sent_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(32);
         Ok(Self {
             key_bytes,
             db_dir,
@@ -762,6 +762,7 @@ impl DbManager {
                 debug!("🔍 msg_type={} (base={}) raw: {}", m.msg_type, base_type, raw_preview);
             }
             let parsed = parse_msg_content(m.msg_type, &content);
+            let chat = m.chat.clone();
             result.push(DbMessage {
                 local_id: m.local_id,
                 server_id: m.server_id,
@@ -778,7 +779,7 @@ impl DbManager {
 
             // 自发消息广播: 通知 verify_sent 等待者
             if is_self {
-                let _ = self.sent_content_tx.send(content);
+                let _ = self.sent_content_tx.send((chat, content));
             }
         }
         drop(contacts_cache); // 显式释放锁
@@ -848,7 +849,7 @@ impl DbManager {
     /// 无需单独查询 DB, 完全复用现有的消息检测流程.
     /// 调用方应在发送前调用 subscribe_sent() 获取 receiver, 避免竞态.
     /// 超时 5 秒兜底.
-    pub async fn verify_sent(&self, text: &str, mut sent_rx: tokio::sync::broadcast::Receiver<String>) -> Result<bool> {
+    pub async fn verify_sent(&self, chat: &str, text: &str, mut sent_rx: tokio::sync::broadcast::Receiver<(String, String)>) -> Result<bool> {
         let text_owned = text.to_string();
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -856,12 +857,8 @@ impl DbManager {
             tokio::select! {
                 result = sent_rx.recv() => {
                     match result {
-                        Ok(content) => {
-                            let content_trimmed = content.trim();
-                            if !content_trimmed.is_empty() && (
-                                content_trimmed.contains(&text_owned)
-                                || text_owned.contains(content_trimmed)
-                            ) {
+                        Ok((actual_chat, content)) => {
+                            if sent_message_matches(chat, &text_owned, &actual_chat, &content) {
                                 info!("✅ [DB] 发送验证成功: \"{}\"", text_owned);
                                 return Ok(true);
                             }
@@ -883,7 +880,7 @@ impl DbManager {
     }
 
     /// 订阅自发消息广播 (在发送前调用, 确保不丢失发送期间的事件)
-    pub fn subscribe_sent(&self) -> tokio::sync::broadcast::Receiver<String> {
+    pub fn subscribe_sent(&self) -> tokio::sync::broadcast::Receiver<(String, String)> {
         self.sent_content_tx.subscribe()
     }
 
@@ -1170,6 +1167,12 @@ fn account_wxid(directory: &str) -> &str {
     } else {
         directory
     }
+}
+
+fn sent_message_matches(expected_chat: &str, expected_text: &str, actual_chat: &str, actual_text: &str) -> bool {
+    expected_chat == actual_chat
+        && !expected_text.trim().is_empty()
+        && expected_text.trim() == actual_text.trim()
 }
 
 #[cfg(test)]

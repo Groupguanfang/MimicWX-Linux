@@ -295,7 +295,7 @@ impl OneBotRuntime {
                 OutgoingPart::Image(source) => {
                     if !text.is_empty() {
                         let response = api::send_text(state, &contact.display_name, &text).await?;
-                        ensure_sent(&response)?;
+                        ensure_text_sent(&response)?;
                         sent_segments.push(segment("text", json!({ "text": text })));
                         text.clear();
                     }
@@ -310,7 +310,7 @@ impl OneBotRuntime {
         }
         if !text.is_empty() {
             let response = api::send_text(state, &contact.display_name, &text).await?;
-            ensure_sent(&response)?;
+            ensure_text_sent(&response)?;
             sent_segments.push(segment("text", json!({ "text": text })));
             receipt = Some(response);
         }
@@ -773,6 +773,14 @@ fn cq_message(segments: &[Value]) -> String {
             format!("[CQ:{kind}{params}]")
         })
         .collect()
+}
+
+fn ensure_text_sent(response: &api::SendResponse) -> Result<(), String> {
+    ensure_sent(response)?;
+    if !response.verified {
+        return Err("尚未在目标会话中确认完整消息，请先检查微信实际发送结果".into());
+    }
+    Ok(())
 }
 
 fn ensure_sent(response: &api::SendResponse) -> Result<(), String> {

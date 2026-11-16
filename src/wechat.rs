@@ -221,6 +221,37 @@ impl WeChat {
         }, 0, 18, 20).await
     }
 
+    async fn find_chat_edit_box(&self, app: &NodeRef, who: &str) -> Option<NodeRef> {
+        let mut pending = vec![(app.clone(), 0u32)];
+        let mut visited = 0;
+        while let Some((node, depth)) = pending.pop() {
+            visited += 1;
+            if visited > 750 {
+                return None;
+            }
+            let role = self.atspi.role(&node).await;
+            if depth > 1 && self.atspi.get_states(&node).await & (1 << 25) == 0 {
+                continue;
+            }
+            if role == "entry" || role == "text" {
+                if self.atspi.name(&node).await.trim() == who {
+                    return Some(node);
+                }
+                continue;
+            }
+            if depth >= 32 || role == "list" {
+                continue;
+            }
+            let count = self.atspi.child_count(&node).await.min(50);
+            for index in (0..count).rev() {
+                if let Some(child) = self.atspi.child_at(&node, index).await {
+                    pending.push((child, depth + 1));
+                }
+            }
+        }
+        None
+    }
+
     /// 在会话容器中按名称查找联系人 (BFS 穿透 filler 层级)
     pub async fn find_session(&self, container: &NodeRef, name: &str) -> Option<NodeRef> {
         let mut frontier = vec![container.clone()];
@@ -232,7 +263,9 @@ impl WeChat {
                 for i in 0..count.min(30) {
                     if let Some(child) = self.atspi.child_at(node, i).await {
                         let item_name = self.atspi.name(&child).await;
-                        if !item_name.trim().is_empty() && item_name.contains(name) {
+                        if self.atspi.role(&child).await == "list item"
+                            && session_name_matches(&item_name, name)
+                        {
                             return Some(child);
                         }
                         let role = self.atspi.role(&child).await;
@@ -345,17 +378,6 @@ impl WeChat {
         engine: &mut InputEngine,
         who: &str,
     ) -> Result<Option<String>> {
-        // 快速路径: 已在目标聊天时跳过切换 (避免重复点击触发双击弹窗)
-        {
-            let current = self.current_chat.lock().await;
-            if let Some(ref name) = *current {
-                if name == who {
-                    info!("💬 已在聊天 [{who}], 跳过切换");
-                    return Ok(Some(who.to_string()));
-                }
-            }
-        }
-
         info!("💬 ChatWith: {who}");
 
         // 先聚焦主窗口 (独立窗口可能遮挡)
@@ -363,6 +385,14 @@ impl WeChat {
 
         let app = self.find_app().await
             .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
+
+        if let Some(editor) = self.find_chat_edit_box(&app, who).await {
+            if !self.atspi.grab_focus(&editor).await {
+                anyhow::bail!("无法聚焦目标会话输入框: {who}");
+            }
+            *self.current_chat.lock().await = Some(who.to_string());
+            return Ok(Some(who.to_string()));
+        }
 
         // 1. 尝试在会话列表中直接定位
         if let Some(list) = self.find_session_list(&app).await {
@@ -372,6 +402,11 @@ impl WeChat {
                     info!("💬 会话列表找到 [{who}], 点击 ({cx}, {cy})");
                     engine.click(cx, cy).await?;
                     tokio::time::sleep(ms(500)).await;
+                    let editor = self.find_chat_edit_box(&app, who).await
+                        .ok_or_else(|| anyhow::anyhow!("切换后无法确认目标会话: {who}"))?;
+                    if !self.atspi.grab_focus(&editor).await {
+                        anyhow::bail!("无法聚焦目标会话输入框: {who}");
+                    }
                     *self.current_chat.lock().await = Some(who.to_string());
                     return Ok(Some(who.to_string()));
                 }
@@ -402,7 +437,10 @@ impl WeChat {
         tokio::time::sleep(ms(500)).await;
 
         // 验证是否切换成功
-        if self.find_message_list(&app).await.is_some() {
+        if let Some(editor) = self.find_chat_edit_box(&app, who).await {
+            if !self.atspi.grab_focus(&editor).await {
+                anyhow::bail!("无法聚焦目标会话输入框: {who}");
+            }
             info!("💬 搜索切换成功: {who}");
             // 仅缓存真正的显示名, 不缓存 chatroom ID (避免后续误跳过)
             if !who.contains("@chatroom") {
@@ -737,6 +775,12 @@ impl WeChat {
         // 2. 等待 WeChat 聚焦输入框
         tokio::time::sleep(ms(300)).await;
 
+        let editor = self.find_chat_edit_box(&app, to).await
+            .ok_or_else(|| anyhow::anyhow!("发送前目标会话已改变: {to}"))?;
+        if !self.atspi.grab_focus(&editor).await {
+            anyhow::bail!("无法聚焦目标会话输入框: {to}");
+        }
+
         // 3. 粘贴消息 (xclip + Ctrl+V)
         engine.paste_text(text).await?;
         tokio::time::sleep(ms(300)).await;
@@ -793,6 +837,14 @@ impl WeChat {
 
         tokio::time::sleep(ms(300)).await;
 
+        let app = self.find_app().await
+            .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
+        let editor = self.find_chat_edit_box(&app, to).await
+            .ok_or_else(|| anyhow::anyhow!("发送图片前目标会话已改变: {to}"))?;
+        if !self.atspi.grab_focus(&editor).await {
+            anyhow::bail!("无法聚焦目标会话输入框: {to}");
+        }
+
         // 粘贴图片
         engine.paste_image(image_path).await?;
         tokio::time::sleep(ms(500)).await;
@@ -823,6 +875,26 @@ impl WeChat {
 // =====================================================================
 // 辅助函数
 // =====================================================================
+
+fn session_name_matches(item_name: &str, target: &str) -> bool {
+    item_name.lines().next().map(str::trim) == Some(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_name_matches;
+
+    #[test]
+    fn session_selection_ignores_message_previews_and_partial_names() {
+        assert!(!session_name_matches(
+            "sandbox@chatroom\n沙盒好友: 测试消息\n16:16",
+            "沙盒好友",
+        ));
+        assert!(session_name_matches("沙盒好友\n测试消息\n16:16", "沙盒好友"));
+        assert!(!session_name_matches("测试裙备份\n测试消息", "测试裙"));
+        assert!(session_name_matches("测试裙\n测试消息", "测试裙"));
+    }
+}
 
 fn is_wechat(name: &str) -> bool {
     let lower = name.to_lowercase();

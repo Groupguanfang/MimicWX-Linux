@@ -164,3 +164,13 @@ fn emoji_url_uses_an_image_segment() {
         "image"
     );
 }
+
+#[test]
+fn unconfirmed_text_is_not_reported_as_success() {
+    let response = crate::api::SendResponse {
+        sent: true,
+        verified: false,
+        message: "accepted by the input queue".into(),
+    };
+    assert!(super::ensure_text_sent(&response).is_err());
+}

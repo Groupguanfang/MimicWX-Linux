@@ -389,6 +389,18 @@ pub async fn send_text(
     // DB 可用时跳过 AT-SPI 验证, 由下面的 DB 验证替代
     let has_db = state.db.is_some();
 
+    let expected_chat = if let Some(db) = &state.db {
+        let matches: Vec<_> = db.get_contacts().await.into_iter()
+            .filter(|contact| contact.username == to || contact.display_name == to)
+            .collect();
+        if matches.len() != 1 {
+            return Err("无法唯一确认目标会话，已取消发送".to_string());
+        }
+        Some(matches[0].username.clone())
+    } else {
+        None
+    };
+
     // 在发送前订阅自发消息广播 (避免竞态: 发送期间的广播不会丢失)
     let sent_rx = state.db.as_ref().map(|db| db.subscribe_sent());
 
@@ -406,7 +418,7 @@ pub async fn send_text(
             // DB 验证 (优先): DB 可用时用已订阅的 receiver 等待匹配
             let verified = if let Some(rx) = sent_rx {
                 state.db.as_ref().unwrap()
-                    .verify_sent(text, rx).await
+                    .verify_sent(expected_chat.as_deref().unwrap_or(to), text, rx).await
                     .unwrap_or(atspi_verified)
             } else {
                 atspi_verified
