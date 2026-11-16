@@ -285,6 +285,15 @@ impl ChatWnd {
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
+        if let Some(ref edit_node) = self.edit_box_node {
+            let contents = self.atspi.text(edit_node).await;
+            if !crate::wechat::empty_input_ready(
+                self.atspi.get_states(edit_node).await,
+                contents.as_deref(),
+            ) {
+                anyhow::bail!("独立窗口输入框已有草稿或无法读取，已取消发送图片: {}", self.who);
+            }
+        }
 
         // 2. 粘贴图片
         engine.paste_image(image_path).await?;

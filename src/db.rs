@@ -231,6 +231,7 @@ pub struct DbManager {
     wal_notify: tokio::sync::broadcast::Sender<()>,
     /// 自发消息内容广播 (get_new_messages 检测到自发消息时发出)
     sent_content_tx: tokio::sync::broadcast::Sender<(String, String)>,
+    received_message_tx: tokio::sync::broadcast::Sender<DbMessage>,
 }
 
 impl DbManager {
@@ -283,6 +284,7 @@ impl DbManager {
 
         let (wal_tx, _) = tokio::sync::broadcast::channel::<()>(64);
         let (sent_tx, _) = tokio::sync::broadcast::channel::<(String, String)>(32);
+        let (received_message_tx, _) = tokio::sync::broadcast::channel::<DbMessage>(128);
         Ok(Self {
             key_bytes,
             db_dir,
@@ -296,6 +298,7 @@ impl DbManager {
             table_meta_cache: std::sync::Mutex::new(HashMap::new()),
             wal_notify: wal_tx,
             sent_content_tx: sent_tx,
+            received_message_tx,
         })
     }
 
@@ -781,6 +784,7 @@ impl DbManager {
             if is_self {
                 let _ = self.sent_content_tx.send((chat, content));
             }
+            let _ = self.received_message_tx.send(result.last().unwrap().clone());
         }
         drop(contacts_cache); // 显式释放锁
 
@@ -879,9 +883,51 @@ impl DbManager {
         Ok(false)
     }
 
+    /// 通过数据库确认自发图片已进入目标会话。
+    ///
+    /// 图片没有可比较的文本内容，必须检查会话、发送方、时间窗和消息类型，
+    /// 不能把输入框粘贴或 Enter 成功当成已经送达。
+    pub async fn verify_image_sent(
+        &self,
+        chat: &str,
+        started_at: i64,
+        mut messages: tokio::sync::broadcast::Receiver<DbMessage>,
+    ) -> Result<bool> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            tokio::select! {
+                result = messages.recv() => {
+                    match result {
+                        Ok(message) => {
+                            if image_receipt_matches(chat, started_at, &message) {
+                                info!("✅ [DB] 图片发送验证成功: {chat}");
+                                return Ok(true);
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            warn!("⚠️ [DB] 消息广播通道已关闭");
+                            break;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    warn!("⚠️ [DB] 图片发送验证超时 (20s): {chat}");
+                    break;
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// 订阅自发消息广播 (在发送前调用, 确保不丢失发送期间的事件)
     pub fn subscribe_sent(&self) -> tokio::sync::broadcast::Receiver<(String, String)> {
         self.sent_content_tx.subscribe()
+    }
+
+    /// 订阅解析后的自发消息，用于图片等无法按文本确认的发送回执。
+    pub fn subscribe_received(&self) -> tokio::sync::broadcast::Receiver<DbMessage> {
+        self.received_message_tx.subscribe()
     }
 
     /// 订阅 WAL 变化通知
@@ -1173,6 +1219,16 @@ fn sent_message_matches(expected_chat: &str, expected_text: &str, actual_chat: &
     expected_chat == actual_chat
         && !expected_text.trim().is_empty()
         && expected_text.trim() == actual_text.trim()
+}
+
+fn image_receipt_matches(expected_chat: &str, started_at: i64, message: &DbMessage) -> bool {
+    expected_chat == message.chat
+        && message.is_self
+        && message.create_time >= started_at - 2
+        && matches!(
+            message.parsed,
+            MsgContent::Image { .. } | MsgContent::Emoji { .. }
+        )
 }
 
 #[cfg(test)]

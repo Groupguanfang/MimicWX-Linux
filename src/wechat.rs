@@ -865,10 +865,20 @@ impl WeChat {
         if !self.atspi.grab_focus(&editor).await {
             anyhow::bail!("无法聚焦目标会话输入框: {to}");
         }
+        let contents = self.atspi.text(&editor).await;
+        if !empty_input_ready(self.atspi.get_states(&editor).await, contents.as_deref()) {
+            anyhow::bail!("目标会话输入框已有草稿或无法读取，已取消发送图片: {to}");
+        }
 
         // 粘贴图片
         engine.paste_image(image_path).await?;
         tokio::time::sleep(ms(500)).await;
+
+        let editor = self.find_chat_edit_box(&app, to).await
+            .ok_or_else(|| anyhow::anyhow!("粘贴图片后目标会话改变或出现弹窗，已取消发送: {to}"))?;
+        if !self.atspi.grab_focus(&editor).await {
+            anyhow::bail!("粘贴图片后无法聚焦目标会话输入框: {to}");
+        }
 
         // Enter 发送
         engine.press_enter().await?;
@@ -913,9 +923,18 @@ fn message_input_ready(states: u64, contents: Option<&str>, expected: &str) -> b
         && actual.trim_end_matches('\n') == expected.trim_end_matches('\n')
 }
 
+pub(crate) fn empty_input_ready(states: u64, contents: Option<&str>) -> bool {
+    let required = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
+    states & required == required
+        && contents.is_some_and(|contents| contents.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{message_input_ready, session_name_matches, STATE_EDITABLE, STATE_FOCUSED, STATE_SHOWING};
+    use super::{
+        empty_input_ready, message_input_ready, session_name_matches, STATE_EDITABLE, STATE_FOCUSED,
+        STATE_SHOWING,
+    };
 
     #[test]
     fn submission_requires_focus_and_the_complete_pasted_message() {
@@ -936,6 +955,16 @@ mod tests {
         assert!(session_name_matches("沙盒好友\n测试消息\n16:16", "沙盒好友"));
         assert!(!session_name_matches("测试裙备份\n测试消息", "测试裙"));
         assert!(session_name_matches("测试裙\n测试消息", "测试裙"));
+    }
+
+    #[test]
+    fn image_submission_requires_a_focused_empty_input() {
+        let ready = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
+        assert!(empty_input_ready(ready, Some("")));
+        assert!(empty_input_ready(ready, Some(" \n")));
+        assert!(!empty_input_ready(ready, Some("旧草稿")));
+        assert!(!empty_input_ready(ready & !STATE_FOCUSED, Some("")));
+        assert!(!empty_input_ready(ready, None));
     }
 }
 

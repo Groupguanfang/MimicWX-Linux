@@ -166,6 +166,17 @@ fn emoji_url_uses_an_image_segment() {
 }
 
 #[test]
+fn quoted_messages_are_scoped_to_their_conversation() {
+    let group = json!({ "chat_id": "room@chatroom", "group_id": "room@chatroom" });
+    let private = json!({ "chat_id": "wxid_friend" });
+    assert!(quote_belongs_to_target(&group, "room@chatroom"));
+    assert!(!quote_belongs_to_target(&group, "other@chatroom"));
+    assert!(quote_belongs_to_target(&private, "wxid_friend"));
+    assert!(!quote_belongs_to_target(&private, "wxid_other"));
+    assert!(quote_belongs_to_target(&json!({}), "any"));
+}
+
+#[test]
 fn unconfirmed_text_is_not_reported_as_success() {
     let response = crate::api::SendResponse {
         sent: true,
@@ -173,4 +184,11 @@ fn unconfirmed_text_is_not_reported_as_success() {
         message: "accepted by the input queue".into(),
     };
     assert!(super::ensure_text_sent(&response).is_err());
+    assert!(super::ensure_image_sent(&response).is_err());
+    assert!(super::ensure_image_sent(&crate::api::SendResponse {
+        sent: true,
+        verified: true,
+        message: "confirmed in the target chat".into(),
+    })
+    .is_ok());
 }

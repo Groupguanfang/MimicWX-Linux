@@ -416,7 +416,9 @@ pub async fn send_text(
     match reply_rx.await {
         Ok(Ok((sent, atspi_verified, message))) => {
             // DB 验证 (优先): DB 可用时用已订阅的 receiver 等待匹配
-            let verified = if let Some(rx) = sent_rx {
+            let verified = if !sent {
+                false
+            } else if let Some(rx) = sent_rx {
                 state.db.as_ref().unwrap()
                     .verify_sent(expected_chat.as_deref().unwrap_or(to), text, rx).await
                     .unwrap_or(atspi_verified)
@@ -467,6 +469,21 @@ pub async fn send_image_bytes(
     to: &str,
     image_data: Vec<u8>,
 ) -> Result<SendResponse, String> {
+    let receipt_rx = state.db.as_ref().map(|db| db.subscribe_received());
+    let expected_chat = if let Some(db) = &state.db {
+        let matches: Vec<_> = db
+            .get_contacts()
+            .await
+            .into_iter()
+            .filter(|contact| contact.username == to || contact.display_name == to)
+            .collect();
+        if matches.len() != 1 {
+            return Err("无法唯一确认图片目标会话，已取消发送".to_string());
+        }
+        Some(matches[0].username.clone())
+    } else {
+        None
+    };
     let ext = if image_data.starts_with(b"\xff\xd8\xff") {
         "jpg"
     } else if image_data.starts_with(b"GIF8") {
@@ -481,6 +498,10 @@ pub async fn send_image_bytes(
         rand_u16());
     tokio::fs::write(&tmp_path, image_data).await
         .map_err(|error| format!("写入图片失败: {error}"))?;
+    let started_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     let (reply_tx, reply_rx) = oneshot::channel();
     let queued = state.input_tx.send(InputCommand::SendImage {
         to: to.to_string(),
@@ -494,7 +515,19 @@ pub async fn send_image_bytes(
         Err("InputEngine actor 已停止".to_string())
     };
     let _ = tokio::fs::remove_file(&tmp_path).await;
-    result.map(|(sent, verified, message)| SendResponse { sent, verified, message })
+    let (sent, atspi_verified, message) = result?;
+    let verified = if !sent {
+        false
+    } else if let (Some(db), Some(receipts), Some(expected_chat)) =
+        (state.db.as_ref(), receipt_rx, expected_chat)
+    {
+        db.verify_image_sent(&expected_chat, started_at, receipts)
+            .await
+            .unwrap_or(atspi_verified)
+    } else {
+        atspi_verified
+    };
+    Ok(SendResponse { sent, verified, message })
 }
 
 async fn get_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {

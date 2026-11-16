@@ -146,6 +146,7 @@ impl OneBotRuntime {
                 "sex": "unknown", "age": 0,
             },
             "message_seq": message.local_id,
+            "chat_id": message.chat,
         });
         if is_group {
             event["group_id"] = json!(message.chat);
@@ -266,10 +267,8 @@ impl OneBotRuntime {
                 .get(&quote_id)
                 .cloned()
                 .ok_or_else(|| "被引用的消息不在缓存中".to_string())?;
-            if let Some(group_id) = quote.get("group_id").and_then(Value::as_str) {
-                if !group_id.is_empty() && group_id != target {
-                    return Err("不能引用其他会话中的消息".into());
-                }
+            if !quote_belongs_to_target(&quote, target) {
+                return Err("不能引用其他会话中的消息".into());
             }
             let preview = quote
                 .get("raw_message")
@@ -302,7 +301,7 @@ impl OneBotRuntime {
                     let bytes = media::image_bytes(&source).await?;
                     let response =
                         api::send_image_bytes(state, &contact.display_name, bytes).await?;
-                    ensure_sent(&response)?;
+                    ensure_image_sent(&response)?;
                     sent_segments.push(segment("image", json!({ "file": source })));
                     receipt = Some(response);
                 }
@@ -607,6 +606,7 @@ fn quote_message_value(quote: &Quote, is_group: bool, chat_id: &str) -> Value {
         "message_type": if is_group { "group" } else { "private" },
         "sender": { "user_id": quote.sender, "nickname": quote.displayname },
         "message": segments, "raw_message": cq_message(&segments),
+        "chat_id": chat_id,
     });
     if is_group {
         value["group_id"] = json!(chat_id);
@@ -789,6 +789,22 @@ fn ensure_sent(response: &api::SendResponse) -> Result<(), String> {
     } else {
         Err(response.message.clone())
     }
+}
+
+fn ensure_image_sent(response: &api::SendResponse) -> Result<(), String> {
+    ensure_sent(response)?;
+    if !response.verified {
+        return Err("尚未在目标会话中确认图片送达，请先检查微信实际发送结果".into());
+    }
+    Ok(())
+}
+
+fn quote_belongs_to_target(quote: &Value, target: &str) -> bool {
+    quote
+        .get("chat_id")
+        .and_then(Value::as_str)
+        .or_else(|| quote.get("group_id").and_then(Value::as_str))
+        .is_none_or(|chat| chat.is_empty() || chat == target)
 }
 
 fn value_string(value: &Value) -> Option<String> {
