@@ -27,7 +27,9 @@ mod snapshot;
 mod voice;
 mod watch;
 
-pub(crate) use history::{HistoryBefore, HistoryCursor, HistoryPage, QuoteHistory};
+pub(crate) use history::{
+    ForwardImageCache, HistoryBefore, HistoryCursor, HistoryPage, QuoteHistory,
+};
 pub(crate) use room::GroupMember;
 
 // =====================================================================
@@ -144,6 +146,33 @@ pub enum MsgContent {
 }
 
 impl MsgContent {
+    pub(crate) fn is_forward_card(&self) -> bool {
+        let Self::App {
+            title,
+            url,
+            app_type,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if *app_type == Some(19) {
+            return true;
+        }
+        if !matches!(app_type, None | Some(0 | 4 | 5 | 40))
+            || !title.as_deref().is_some_and(|title| {
+                let title = title.trim();
+                title == "聊天记录" || title.ends_with("的聊天记录")
+            })
+        {
+            return false;
+        }
+        match url.as_deref().map(str::trim) {
+            None | Some("") => *app_type != Some(40),
+            Some(url) => is_forward_preview_url(url),
+        }
+    }
+
     /// 消息类型的简短描述 (用于日志)
     pub fn type_label(&self) -> &'static str {
         match self {
@@ -284,6 +313,19 @@ pub(crate) struct LocalImageMetadata {
     pub create_time: i64,
     pub hashes: Vec<String>,
     pub content: String,
+}
+
+pub(crate) fn media_month(timestamp: i64) -> Option<String> {
+    if timestamp <= 0 {
+        return None;
+    }
+    let timestamp: libc::time_t = timestamp.try_into().ok()?;
+    let mut date = std::mem::MaybeUninit::<libc::tm>::uninit();
+    if unsafe { libc::localtime_r(&timestamp, date.as_mut_ptr()) }.is_null() {
+        return None;
+    }
+    let date = unsafe { date.assume_init() };
+    Some(format!("{:04}-{:02}", date.tm_year + 1900, date.tm_mon + 1))
 }
 
 // =====================================================================
@@ -971,13 +1013,13 @@ impl DbManager {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs() as i64;
                         for message in msgs {
-                            if media_content_pending(
-                                message.msg_type,
-                                &message.content,
-                                message_is_self(&self_wxid, &message.talker, message.status, message.msg_type),
-                            )
-                                && message.create_time > now.saturating_sub(15)
+                            if message.create_time > now.saturating_sub(15)
                                 && message.create_time <= now.saturating_add(5)
+                                && message_content_pending(
+                                    message.msg_type,
+                                    &message.content,
+                                    message_is_self(&self_wxid, &message.talker, message.status, message.msg_type),
+                                )
                             {
                                 break;
                             }
@@ -1787,11 +1829,31 @@ fn sticker_receipt_matches(
             .is_some_and(|actual| actual.eq_ignore_ascii_case(checksum))
 }
 
-fn media_content_pending(msg_type: i64, content: &str, is_self: bool) -> bool {
+fn is_forward_preview_url(url: &str) -> bool {
+    let Ok(uri) = url.parse::<axum::http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") || uri.host() != Some("support.weixin.qq.com") {
+        return false;
+    }
+    let template = match uri.path() {
+        "/security/readtemplate" => "w_security_center_website/upgrade",
+        "/cgi-bin/mmsupport-bin/readtemplate" => "page/favorite_record__w_unsupport",
+        _ => return false,
+    };
+    axum::extract::Query::<HashMap<String, String>>::try_from_uri(&uri)
+        .is_ok_and(|params| params.get("t").is_some_and(|value| value == template))
+}
+
+fn message_content_pending(msg_type: i64, content: &str, is_self: bool) -> bool {
     match msg_type & 0xFFFF {
-        3 | 47 if content.trim().is_empty() => true,
+        3 | 47 | 49 if content.trim().is_empty() => true,
         47 if is_self => {
             extract_xml_attr(content, "emoji", "md5").is_none_or(|checksum| checksum.is_empty())
+        }
+        49 => {
+            parse_app(msg_type, content).is_forward_card()
+                && !crate::onebot::has_forward_record(content)
         }
         _ => false,
     }
@@ -1814,7 +1876,7 @@ pub(crate) fn parse_msg_content(msg_type: i64, content: &str) -> MsgContent {
         42 => parse_contact_card(content),
         43 => parse_video(content),
         47 => parse_emoji(content),
-        49 => parse_app(content),
+        49 => parse_app(msg_type, content),
         10000 | 10002 => MsgContent::System {
             text: content.to_string(),
         },
@@ -1869,11 +1931,15 @@ fn parse_emoji(content: &str) -> MsgContent {
 
 /// 链接/文件/小程序消息 (msg_type=49): 解析 appmsg XML
 /// app_type 子类型: 3=音乐, 4=链接, 5=链接, 6=文件, 19=转发, 33/36=小程序, 2000=转账, 2001=红包
-fn parse_app(content: &str) -> MsgContent {
+fn parse_app(msg_type: i64, content: &str) -> MsgContent {
     let title = extract_xml_text(content, "title");
     let desc = extract_xml_text(content, "des");
     let url = extract_xml_text(content, "url");
-    let app_type = extract_xml_text(content, "type").and_then(|t| t.parse::<i32>().ok());
+    let app_type = if msg_type >> 32 == 19 {
+        Some(19)
+    } else {
+        extract_xml_text(content, "type").and_then(|value| value.trim().parse().ok())
+    };
     MsgContent::App {
         title,
         desc,

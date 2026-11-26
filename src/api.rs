@@ -98,6 +98,14 @@ pub enum InputCommand {
         who: String,
         reply: oneshot::Sender<anyhow::Result<Option<String>>>,
     },
+    LoadForwardImages {
+        to: String,
+        target: NativeQuoteTarget,
+        directory: std::path::PathBuf,
+        indexes: Vec<usize>,
+        deadline: tokio::time::Instant,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
     AddListen {
         who: String,
         reply: oneshot::Sender<anyhow::Result<bool>>,
@@ -144,6 +152,28 @@ pub fn spawn_input_actor(
                 InputCommand::ChatWith { who, reply } => {
                     let result = wechat.chat_with(&mut engine, &who).await;
                     let _ = reply.send(result);
+                }
+                InputCommand::LoadForwardImages {
+                    to,
+                    target,
+                    directory,
+                    indexes,
+                    deadline,
+                    reply,
+                } => {
+                    if !reply.is_closed() && tokio::time::Instant::now() < deadline {
+                        let result = wechat
+                            .load_forward_images(
+                                &mut engine,
+                                &to,
+                                &target,
+                                &directory,
+                                &indexes,
+                                deadline,
+                            )
+                            .await;
+                        let _ = reply.send(result);
+                    }
                 }
                 InputCommand::SendVoice {
                     to,

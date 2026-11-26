@@ -1,8 +1,9 @@
-use super::{build_single_table_meta, read_message_row, DbManager, DbMessage, RawMsg};
+use super::{build_single_table_meta, media_month, read_message_row, DbManager, DbMessage, RawMsg};
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Params};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -29,7 +30,97 @@ pub(crate) struct QuoteHistory {
     pub complete_minutes: Range<i64>,
 }
 
+pub(crate) struct ForwardImageCache {
+    pub account: PathBuf,
+    pub wxid: String,
+    pub directory: PathBuf,
+    pub chat: String,
+    pub server_id: i64,
+}
+
+impl ForwardImageCache {
+    pub fn image_path(&self, index: usize) -> PathBuf {
+        self.directory.join(index.to_string())
+    }
+}
+
+pub(super) fn record_cache_id(packed: &[u8]) -> Option<&str> {
+    let mut matches = packed.windows(20).filter_map(|field| {
+        let name = field.strip_prefix(&[0x4a, 0x12, 0x0a, 0x10])?;
+        if !name.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        std::str::from_utf8(name).ok()
+    });
+    let name = matches.next()?;
+    matches.next().is_none().then_some(name)
+}
+
 impl DbManager {
+    pub(crate) async fn forward_image_cache(
+        &self,
+        chat: &str,
+        server_id: i64,
+    ) -> Result<Option<ForwardImageCache>> {
+        if chat.is_empty() || server_id <= 0 {
+            return Ok(None);
+        }
+        let connections = self
+            .ensure_msg_conns(false)?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let account = self
+            .db_dir
+            .parent()
+            .context("缺少微信账号目录")?
+            .to_path_buf();
+        let chat = chat.to_string();
+        let wxid = self.self_wxid.clone();
+        tokio::task::spawn_blocking(move || {
+            let chat_hash = format!("{:x}", md5::compute(&chat));
+            let query = format!(
+                "SELECT create_time, packed_info_data FROM [Msg_{chat_hash}]
+                 WHERE server_id=?1 AND (local_type & 65535)=49 LIMIT 2"
+            );
+            let mut result = None;
+            for connection in connections {
+                let connection = connection
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("转发图片元数据连接不可用"))?;
+                let Ok(mut statement) = connection.prepare(&query) else {
+                    continue;
+                };
+                let mut rows = statement.query([server_id])?;
+                while let Some(row) = rows.next()? {
+                    let packed = row.get::<_, Vec<u8>>(1).unwrap_or_default();
+                    let Some(cache_id) = record_cache_id(&packed) else {
+                        continue;
+                    };
+                    let Some(month) = media_month(row.get(0)?) else {
+                        continue;
+                    };
+                    anyhow::ensure!(result.is_none(), "转发图片缓存 ID 不唯一");
+                    result = Some(ForwardImageCache {
+                        directory: account
+                            .join("msg/attach")
+                            .join(&chat_hash)
+                            .join(month)
+                            .join("Rec")
+                            .join(cache_id)
+                            .join("Img"),
+                        account: account.clone(),
+                        wxid: wxid.clone(),
+                        chat: chat.clone(),
+                        server_id,
+                    });
+                }
+            }
+            Ok(result)
+        })
+        .await?
+    }
+
     pub(crate) async fn app_message_content(
         &self,
         chat: String,

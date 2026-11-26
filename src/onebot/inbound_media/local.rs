@@ -11,7 +11,7 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::{media, Image, ImageQuality, ORIGINAL_UNAVAILABLE};
-use crate::db::LocalImageMetadata;
+use crate::db::{media_month, ForwardImageCache, LocalImageMetadata};
 
 const MAX_BYTES: usize = 20 * 1024 * 1024;
 const V1: &[u8] = b"\x07\x08V1\x08\x07";
@@ -105,16 +105,15 @@ fn decode_dat(bytes: &[u8], key: Option<ImageKey>) -> Result<Vec<u8>, String> {
     Err("不支持的本地图片格式".into())
 }
 
-fn keys(metadata: &LocalImageMetadata) -> Vec<ImageKey> {
-    let Some(home) = metadata.account.parent().and_then(Path::parent) else {
+fn keys(account: &Path, wxid: &str) -> Vec<ImageKey> {
+    let Some(home) = account.parent().and_then(Path::parent) else {
         return Vec::new();
     };
     let directory = home.join(".xwechat/net/kvcomm");
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
     };
-    let account_name = metadata
-        .account
+    let account_name = account
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
@@ -132,7 +131,7 @@ fn keys(metadata: &LocalImageMetadata) -> Vec<ImageKey> {
             let Ok(number) = code.parse::<u64>() else {
                 continue;
             };
-            for identity in [metadata.wxid.as_str(), account_name] {
+            for identity in [wxid, account_name] {
                 let digest = format!("{:x}", md5::compute(format!("{code}{identity}")));
                 let mut aes = [0; 16];
                 aes.copy_from_slice(&digest.as_bytes()[..16]);
@@ -195,21 +194,8 @@ fn recover_key(bytes: &[u8], account: &Path, wxid: &str) -> Option<ImageKey> {
     None
 }
 
-fn month(timestamp: i64) -> Option<String> {
-    if timestamp <= 0 {
-        return None;
-    }
-    let timestamp: libc::time_t = timestamp.try_into().ok()?;
-    let mut date = std::mem::MaybeUninit::<libc::tm>::uninit();
-    if unsafe { libc::localtime_r(&timestamp, date.as_mut_ptr()) }.is_null() {
-        return None;
-    }
-    let date = unsafe { date.assume_init() };
-    Some(format!("{:04}-{:02}", date.tm_year + 1900, date.tm_mon + 1))
-}
-
 fn paths(metadata: &LocalImageMetadata, standard_is_full: bool) -> Vec<(PathBuf, ImageQuality)> {
-    let Some(month) = month(metadata.create_time) else {
+    let Some(month) = media_month(metadata.create_time) else {
         return Vec::new();
     };
     let chat = format!("{:x}", md5::compute(&metadata.chat));
@@ -371,7 +357,7 @@ pub(super) async fn image(
     }
     let account = metadata.account.clone();
     let wxid = metadata.wxid.clone();
-    let keys = tokio::task::spawn_blocking(move || keys(&metadata))
+    let keys = tokio::task::spawn_blocking(move || keys(&metadata.account, &metadata.wxid))
         .await
         .map_err(|_| "读取账号图片密钥失败")?;
     let checksum_quality = original_md5.map(|checksum| {
@@ -406,6 +392,83 @@ pub(super) async fn image(
     unreachable!()
 }
 
+pub(super) async fn forward_image(
+    cache: &ForwardImageCache,
+    index: usize,
+    checksum: Option<&str>,
+) -> Result<Image, String> {
+    let path = cache.image_path(index);
+    let account = cache.account.clone();
+    let wxid = cache.wxid.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let bytes = read_image(&path, &account)?;
+        let keys = if bytes.starts_with(V2) {
+            keys(&account, &wxid)
+        } else {
+            Vec::new()
+        };
+        decode_local_image(&bytes, &account, &wxid, &keys)
+    })
+    .await
+    .map_err(|_| "转发图片解码任务失败")?
+    .map_err(|error| {
+        if matches!(
+            error.as_str(),
+            "图片尚未下载到微信客户端" | "本地图片文件不完整"
+        ) {
+            ORIGINAL_UNAVAILABLE.to_owned()
+        } else {
+            error
+        }
+    })?;
+    let quality =
+        if checksum.is_some_and(|expected| format!("{:x}", md5::compute(&bytes)) == expected) {
+            ImageQuality::Original
+        } else {
+            ImageQuality::Full
+        };
+    local_image(bytes, quality).await
+}
+
+fn decode_local_image(
+    bytes: &[u8],
+    account: &Path,
+    wxid: &str,
+    keys: &[ImageKey],
+) -> Result<Vec<u8>, String> {
+    if !bytes.starts_with(V2) {
+        return decode_dat(bytes, None);
+    }
+    let layout = decode_dat(bytes, None);
+    if layout
+        .as_ref()
+        .err()
+        .is_some_and(|error| error != "当前账号图片密钥尚未就绪")
+    {
+        return layout;
+    }
+    keys.iter()
+        .find_map(|key| decode_dat(bytes, Some(*key)).ok())
+        .or_else(|| {
+            recover_key(bytes, account, wxid).and_then(|key| decode_dat(bytes, Some(key)).ok())
+        })
+        .ok_or_else(|| "本地图片账号密钥不匹配".to_string())
+}
+
+async fn local_image(bytes: Vec<u8>, quality: ImageQuality) -> Result<Image, String> {
+    let bytes = if bytes.starts_with(b"wxgf") {
+        wxgf_to_png(&bytes).await?
+    } else {
+        bytes
+    };
+    let content_type = media::image_content_type(&bytes).ok_or("解密结果不是支持的图片")?;
+    Ok(Image {
+        bytes: bytes.into(),
+        content_type,
+        quality,
+    })
+}
+
 async fn read_candidates(
     candidates: &[(PathBuf, ImageQuality)],
     account: &Path,
@@ -422,25 +485,7 @@ async fn read_candidates(
         let keys = keys.to_vec();
         let decoded = tokio::task::spawn_blocking(move || {
             let bytes = read_image(&path, &account)?;
-            if bytes.starts_with(V2) {
-                let layout = decode_dat(&bytes, None);
-                if layout
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error != "当前账号图片密钥尚未就绪")
-                {
-                    return layout;
-                }
-                keys.iter()
-                    .find_map(|key| decode_dat(&bytes, Some(*key)).ok())
-                    .or_else(|| {
-                        recover_key(&bytes, &account, &wxid)
-                            .and_then(|key| decode_dat(&bytes, Some(key)).ok())
-                    })
-                    .ok_or_else(|| "本地图片账号密钥不匹配".to_string())
-            } else {
-                decode_dat(&bytes, None)
-            }
+            decode_local_image(&bytes, &account, &wxid, &keys)
         })
         .await
         .map_err(|_| "本地图片解密任务失败")?;
@@ -456,17 +501,7 @@ async fn read_candidates(
             if original_only && !quality.is_full() {
                 return Err(ORIGINAL_UNAVAILABLE.into());
             }
-            let bytes = if bytes.starts_with(b"wxgf") {
-                wxgf_to_png(&bytes).await?
-            } else {
-                bytes
-            };
-            let content_type = media::image_content_type(&bytes).ok_or("解密结果不是支持的图片")?;
-            Ok::<_, String>(Image {
-                bytes: bytes.into(),
-                content_type,
-                quality,
-            })
+            local_image(bytes, quality).await
         }
         .await;
         match result {

@@ -1,5 +1,6 @@
 use quick_xml::{events::Event, Reader};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 
 use super::{segment, xml_text};
 
@@ -19,14 +20,16 @@ struct ForwardNode {
     timestamp: i64,
     display_time: String,
     text: String,
+    image: Option<ForwardImage>,
 }
 
-pub(super) fn app_type(content: &str) -> Option<u32> {
-    if content.len() > MAX_RECORD_BYTES {
-        return None;
-    }
-    let app = raw_element(content, b"appmsg")?;
-    xml_text(&app, "type")?.trim().parse().ok()
+pub(super) struct ForwardImage {
+    pub index: usize,
+    pub checksum: Option<String>,
+}
+
+pub(crate) fn has_forward_record(content: &str) -> bool {
+    ForwardRecord::parse(content).is_some()
 }
 
 impl ForwardRecord {
@@ -35,9 +38,6 @@ impl ForwardRecord {
             return None;
         }
         let app = raw_element(content, b"appmsg")?;
-        if xml_text(&app, "type")?.trim() != "19" {
-            return None;
-        }
         let raw_record = raw_element(&app, b"recorditem")?;
         let decoded;
         let record = if raw_record.trim_start().starts_with("<recordinfo") {
@@ -46,7 +46,8 @@ impl ForwardRecord {
             decoded = xml_text(&app, "recorditem")?;
             decoded.as_str()
         };
-        let list = raw_element(record, b"datalist")?;
+        let info = raw_element(record, b"recordinfo")?;
+        let list = raw_element(&info, b"datalist")?;
         let title = xml_text(record, "title")
             .or_else(|| xml_text(&app, "title"))
             .map(|text| bounded(text.trim(), 240).to_owned())
@@ -68,7 +69,7 @@ impl ForwardRecord {
                         .flatten()
                         .and_then(|attribute| attribute.unescape_value().ok()?.parse::<u32>().ok());
                     let body = reader.read_text(item.name()).ok()?;
-                    let node = ForwardNode::parse(kind, &body);
+                    let node = ForwardNode::parse(kind, &body, record.nodes.len());
                     bytes += node.sender.len() + node.display_time.len() + node.text.len() + 16;
                     if record.nodes.len() == MAX_NODES || bytes > MAX_CONTEXT_BYTES {
                         record.truncated = true;
@@ -83,9 +84,14 @@ impl ForwardRecord {
         (!record.nodes.is_empty()).then_some(record)
     }
 
-    pub(super) fn context(&self) -> String {
+    pub(super) fn images(&self) -> impl Iterator<Item = &ForwardImage> {
+        self.nodes.iter().filter_map(|node| node.image.as_ref())
+    }
+
+    pub(super) fn context(&self, images: &HashMap<usize, Value>) -> String {
         let mut text = format!("[合并转发｜{}]", self.title);
-        for node in &self.nodes {
+        let mut image_number = 0;
+        for (index, node) in self.nodes.iter().enumerate() {
             text.push('\n');
             if !node.display_time.is_empty() {
                 text.push_str(&node.display_time);
@@ -94,6 +100,10 @@ impl ForwardRecord {
             text.push_str(&node.sender);
             text.push_str("：");
             text.push_str(&node.text);
+            if images.contains_key(&index) {
+                image_number += 1;
+                text.push_str(&format!("（图 {image_number}）"));
+            }
         }
         if self.truncated {
             text.push_str("\n[其余消息已省略]");
@@ -102,18 +112,21 @@ impl ForwardRecord {
         text
     }
 
-    pub(super) fn onebot(&self) -> Value {
+    pub(super) fn onebot(&self, images: &HashMap<usize, Value>) -> Value {
         let nodes = self
             .nodes
             .iter()
-            .map(|node| {
+            .enumerate()
+            .map(|(index, node)| {
+                let mut content = vec![segment("text", json!({ "text": node.text }))];
+                content.extend(images.get(&index).cloned());
                 segment(
                     "node",
                     json!({
                         "user_id": "0",
                         "nickname": node.sender,
                         "time": node.timestamp,
-                        "content": [segment("text", json!({ "text": node.text }))],
+                        "content": content,
                     }),
                 )
             })
@@ -127,7 +140,7 @@ impl ForwardRecord {
 }
 
 impl ForwardNode {
-    fn parse(kind: Option<u32>, body: &str) -> Self {
+    fn parse(kind: Option<u32>, body: &str, index: usize) -> Self {
         let sender = xml_text(body, "sourcename")
             .map(|text| single_line(&text, 120))
             .filter(|name| !name.is_empty())
@@ -170,6 +183,12 @@ impl ForwardNode {
             timestamp,
             display_time,
             text,
+            image: (kind == Some(2)).then(|| ForwardImage {
+                index,
+                checksum: xml_text(body, "fullmd5")
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .filter(|value| super::inbound_media::is_md5(value)),
+            }),
         }
     }
 }

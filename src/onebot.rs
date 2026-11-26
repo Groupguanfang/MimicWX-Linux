@@ -5,6 +5,7 @@ mod media;
 mod mention;
 mod reverse;
 
+pub(crate) use forward::has_forward_record;
 pub use reverse::ReverseConfig;
 
 use axum::{
@@ -28,8 +29,9 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, oneshot, Mutex, Semaphore};
 use tokio::task::{JoinError, JoinSet};
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as ClientMessage;
 use tracing::{debug, warn};
 
@@ -174,6 +176,7 @@ pub struct OneBotRuntime {
     seen: Mutex<MessageCache>,
     fast_dispatch: Mutex<FastDispatch>,
     send_lock: Mutex<()>,
+    forward_downloads: Semaphore,
     media: Option<inbound_media::Store>,
     database: Option<Arc<DbManager>>,
 }
@@ -219,25 +222,81 @@ impl OneBotRuntime {
             seen: Mutex::new(MessageCache::default()),
             fast_dispatch: Mutex::new(FastDispatch::default()),
             send_lock: Mutex::new(()),
+            forward_downloads: Semaphore::new(1),
             media,
             database,
         })
     }
 
-    async fn prepare_forward(&self, content: &str, id: &str, segments: &mut Vec<Value>) -> bool {
+    async fn prepare_forward(
+        &self,
+        content: &str,
+        id: &str,
+        chat: &str,
+        server_id: i64,
+        segments: &mut Vec<Value>,
+    ) -> bool {
         let Some(record) = forward::ForwardRecord::parse(content) else {
             return false;
         };
+        let images = self.prepare_forward_images(&record, chat, server_id).await;
         self.forward_records.lock().await.insert_bounded(
             id.to_owned(),
-            record.onebot(),
+            record.onebot(&images),
             FORWARD_CACHE_LIMIT,
         );
         *segments = vec![
             segment("forward", json!({ "id": id })),
-            segment("text", json!({ "text": record.context() })),
+            segment("text", json!({ "text": record.context(&images) })),
         ];
+        segments.extend(
+            record
+                .images()
+                .filter_map(|image| images.get(&image.index).cloned()),
+        );
         true
+    }
+
+    async fn prepare_forward_images(
+        &self,
+        record: &forward::ForwardRecord,
+        chat: &str,
+        server_id: i64,
+    ) -> HashMap<usize, Value> {
+        let mut images = HashMap::new();
+        let (Some(media), Some(database)) = (&self.media, &self.database) else {
+            return images;
+        };
+        let indexes: Vec<_> = record.images().map(|image| image.index).collect();
+        if indexes.is_empty() {
+            return images;
+        }
+        let cache = match database.forward_image_cache(chat, server_id).await {
+            Ok(Some(cache)) => cache,
+            Ok(None) => return images,
+            Err(error) => {
+                warn!(%error, "无法读取合并转发的图片索引");
+                return images;
+            }
+        };
+        let batch = Arc::new(inbound_media::ForwardImages {
+            cache,
+            indexes,
+            last_download: Mutex::new(None),
+        });
+        for image in record.images() {
+            if let Some(id) = media
+                .register_forward_image(Arc::clone(&batch), image.index, image.checksum.clone())
+                .await
+            {
+                let url = format!("{}&original=1", media.url(&id));
+                images.insert(
+                    image.index,
+                    segment("image", json!({ "file": id, "url": url })),
+                );
+            }
+        }
+        images
     }
 
     async fn prepare_quoted_forward(
@@ -246,25 +305,42 @@ impl OneBotRuntime {
         chat: &str,
         segments: &mut Vec<Value>,
     ) -> bool {
-        let kind = quote.kind & 0xffff;
-        if kind != 19
-            && (kind != 49 || forward::app_type(&quote.content).is_some_and(|app| app != 19))
-        {
-            return false;
+        match quote.kind & 0xffff {
+            19 => {}
+            49 => {
+                let parsed = crate::db::parse_msg_content(quote.kind, &quote.content);
+                if matches!(
+                    parsed,
+                    MsgContent::App {
+                        app_type: Some(_),
+                        ..
+                    }
+                ) && !parsed.is_forward_card()
+                {
+                    return false;
+                }
+            }
+            _ => return false,
         }
+        let server_id = quote.svrid.parse().unwrap_or_default();
         if self
-            .prepare_forward(&quote.content, &quote.svrid, segments)
+            .prepare_forward(&quote.content, &quote.svrid, chat, server_id, segments)
             .await
         {
             return true;
         }
-        if let (Some(database), Ok(server_id)) = (&self.database, quote.svrid.parse::<i64>()) {
+        if let Some(database) = &self.database {
+            if server_id <= 0 {
+                return false;
+            }
             match database
                 .app_message_content(chat.to_owned(), server_id)
                 .await
             {
                 Ok(Some(content)) => {
-                    return self.prepare_forward(&content, &quote.svrid, segments).await;
+                    return self
+                        .prepare_forward(&content, &quote.svrid, chat, server_id, segments)
+                        .await;
                 }
                 Ok(None) => {}
                 Err(error) => warn!(%error, "无法读取引用的聊天记录"),
@@ -344,6 +420,77 @@ impl OneBotRuntime {
                 (status, error).into_response()
             }
         }
+    }
+
+    async fn load_forward_media(&self, state: &Arc<AppState>, id: &str) {
+        let (Some(media), Some(database)) = (&self.media, &self.database) else {
+            return;
+        };
+        let Some((images, index)) = media.forward_image(id).await else {
+            return;
+        };
+        let path = images.cache.image_path(index);
+        if path.is_file() {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let _ = tokio::time::timeout_at(deadline, async {
+            let mut last_download = images.last_download.lock().await;
+            if path.is_file()
+                || last_download.is_some_and(|attempt| attempt.elapsed() < Duration::from_secs(20))
+            {
+                return;
+            }
+            let Ok(_permit) = self.forward_downloads.try_acquire() else {
+                return;
+            };
+            let result = async {
+                let history = database
+                    .quote_history(images.cache.chat.clone(), images.cache.server_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let original = &history.messages[history.target_index];
+                let MsgContent::App {
+                    title: Some(title), ..
+                } = &original.parsed
+                else {
+                    return Err("合并转发缺少微信窗口标题".to_owned());
+                };
+                if !original.parsed.is_forward_card() || title.trim().is_empty() {
+                    return Err("无法确认微信合并转发的原消息".to_owned());
+                }
+                let target = NativeQuoteTarget {
+                    server_id: original.server_id.to_string(),
+                    text: title.clone(),
+                    sender_name: original.talker_display_name.clone(),
+                    is_self: original.is_self,
+                    history,
+                };
+                let to = self.display_name(state, &images.cache.chat).await;
+                let (reply, received) = oneshot::channel();
+                state
+                    .input_tx
+                    .try_send(api::InputCommand::LoadForwardImages {
+                        to,
+                        target,
+                        directory: images.cache.directory.clone(),
+                        indexes: images.indexes.clone(),
+                        deadline,
+                        reply,
+                    })
+                    .map_err(|_| "微信操作队列繁忙".to_owned())?;
+                *last_download = Some(Instant::now());
+                received
+                    .await
+                    .map_err(|_| "微信操作队列已关闭".to_owned())?
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            if let Err(error) = result {
+                debug!(%error, "微信合并转发图片暂不可用");
+            }
+        })
+        .await;
     }
 
     fn authorized(&self, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
@@ -490,20 +637,30 @@ impl OneBotRuntime {
                 quoted["raw_message"] = json!(raw_message);
             }
             let mut cache = messages.lock().await;
-            if !cache.values.contains_key(&quote.svrid)
-                || (forward_prepared && cache.values[&quote.svrid].get("message_seq").is_none())
-            {
-                cache.insert(quote.svrid, quoted);
+            match cache.values.get_mut(&quote.svrid) {
+                Some(previous) if forward_prepared => {
+                    previous["message"] = quoted["message"].take();
+                    previous["raw_message"] = quoted["raw_message"].take();
+                }
+                None => {
+                    cache.insert(quote.svrid, quoted);
+                }
+                _ => {}
             }
         }
         let mut body = message_segments(message, &self.self_id, &self.self_name);
-        if let MsgContent::App {
-            title,
-            app_type: Some(19),
-            ..
-        } = &message.parsed
-        {
-            if !self.prepare_forward(&message.content, id, &mut body).await {
+        if let MsgContent::App { title, .. } = &message.parsed {
+            if message.parsed.is_forward_card()
+                && !self
+                    .prepare_forward(
+                        &message.content,
+                        id,
+                        &message.chat,
+                        message.server_id,
+                        &mut body,
+                    )
+                    .await
+            {
                 let title = title.as_deref().unwrap_or("聊天记录");
                 body = vec![segment(
                     "text",
@@ -552,19 +709,22 @@ impl OneBotRuntime {
 
     async fn cached_message(&self, id: &str) -> Option<Value> {
         let live = self.messages.lock().await.values.get(id).cloned();
+        let history = self.history_messages.lock().await;
+        let latest = history.values.get(id);
+        if latest.is_some_and(|message| {
+            message["message"]
+                .as_array()
+                .is_some_and(|segments| segments.iter().any(|segment| segment["type"] == "forward"))
+        }) {
+            return latest.cloned();
+        }
         if live
             .as_ref()
             .is_some_and(|message| message.get("message_seq").is_some())
         {
             return live;
         }
-        self.history_messages
-            .lock()
-            .await
-            .values
-            .get(id)
-            .cloned()
-            .or(live)
+        latest.cloned().or(live)
     }
 
     async fn handle_action(
@@ -657,6 +817,7 @@ impl OneBotRuntime {
             "get_image" => {
                 let id = required_id(params, "file")?;
                 let media = self.media.as_ref().ok_or("媒体代理尚未配置")?;
+                self.load_forward_media(state, &id).await;
                 let image = media.image(&id).await?;
                 let extension = image.content_type.rsplit('/').next().unwrap_or("image");
                 Ok(json!({
@@ -978,6 +1139,7 @@ pub async fn ws_handler(
     };
     if let Some(id) = query.get("media") {
         let original_only = query.get("original").is_some_and(|value| value == "1");
+        runtime.load_forward_media(&state, id).await;
         return runtime.media_response(id, original_only).await;
     }
     if !runtime.authorized(&headers, &query) {

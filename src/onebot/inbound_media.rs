@@ -4,8 +4,10 @@ use quick_xml::{events::Event, Reader};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
+use tokio::time::Instant;
 
 use super::media;
+use crate::db::ForwardImageCache;
 
 mod local;
 
@@ -43,6 +45,13 @@ struct Attachment {
     standard_is_full: bool,
     local_image: Option<(String, i64)>,
     local_voice: Option<(String, i64)>,
+    forward_image: Option<(Arc<ForwardImages>, usize)>,
+}
+
+pub(super) struct ForwardImages {
+    pub cache: ForwardImageCache,
+    pub indexes: Vec<usize>,
+    pub last_download: Mutex<Option<Instant>>,
 }
 
 #[derive(Clone)]
@@ -143,6 +152,7 @@ impl Store {
                 standard_is_full: false,
                 local_image: None,
                 local_voice: None,
+                forward_image: None,
             })
         })?;
         if context.is_none() && attachment.sources.is_empty() && attachment.emoji_md5.is_none() {
@@ -153,6 +163,39 @@ impl Store {
         } else {
             attachment.local_image = context;
         }
+        self.insert_attachment(attachment).await
+    }
+
+    pub async fn register_forward_image(
+        &self,
+        images: Arc<ForwardImages>,
+        index: usize,
+        checksum: Option<String>,
+    ) -> Option<String> {
+        self.insert_attachment(Attachment {
+            sources: Vec::new(),
+            emoji_md5: None,
+            original_md5: checksum,
+            standard_is_full: false,
+            local_image: None,
+            local_voice: None,
+            forward_image: Some((images, index)),
+        })
+        .await
+    }
+
+    pub async fn forward_image(&self, id: &str) -> Option<(Arc<ForwardImages>, usize)> {
+        self.cache
+            .lock()
+            .await
+            .entries
+            .get(id)?
+            .attachment
+            .forward_image
+            .clone()
+    }
+
+    async fn insert_attachment(&self, attachment: Attachment) -> Option<String> {
         let mut random = [0u8; 32];
         getrandom::fill(&mut random).ok()?;
         let id = random
@@ -207,6 +250,12 @@ impl Store {
             .acquire()
             .await
             .map_err(|_| "媒体下载已停止")?;
+        if let Some((images, index)) = &attachment.forward_image {
+            let image =
+                local::forward_image(&images.cache, *index, attachment.original_md5.as_deref())
+                    .await?;
+            return Ok(self.cache_image(id, image).await);
+        }
         if let Some((chat, server_id)) = &attachment.local_voice {
             let database = self.database.as_ref().ok_or("语音数据库尚未就绪")?;
             let mut audio = None;
@@ -479,6 +528,7 @@ impl Attachment {
             standard_is_full,
             local_image: None,
             local_voice: None,
+            forward_image: None,
         })
     }
 }
@@ -574,7 +624,7 @@ fn attributes(content: &str, tag: &str) -> Option<HashMap<String, String>> {
     }
 }
 
-fn is_md5(value: &str) -> bool {
+pub(super) fn is_md5(value: &str) -> bool {
     value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 

@@ -298,6 +298,55 @@ async fn opaque_images_register_only_with_a_database_and_message_identity() {
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn forward_image_waits_for_the_full_cache_file() {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).unwrap();
+    let account = std::env::temp_dir().join(format!(
+        "mimicwx-forward-fixture-{}",
+        u64::from_le_bytes(random)
+    ));
+    let directory = account.join("Rec/0123456789abcdef/Img");
+    std::fs::create_dir_all(&directory).unwrap();
+    let images = Arc::new(ForwardImages {
+        cache: ForwardImageCache {
+            account: account.clone(),
+            wxid: "wxid_test".into(),
+            directory: directory.clone(),
+            chat: "room@chatroom".into(),
+            server_id: 123,
+        },
+        indexes: vec![4, 9],
+        last_download: Mutex::new(None),
+    });
+    let store = Store::new("https://example.test/onebot/ws".into()).unwrap();
+    let plain = from_hex(PLAIN);
+    std::fs::write(directory.join("4_t"), &plain).unwrap();
+    let original = store
+        .register_forward_image(Arc::clone(&images), 4, Some(CHECKSUM.to_owned()))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.original(&original).await.err().as_deref(),
+        Some(ORIGINAL_UNAVAILABLE)
+    );
+    std::fs::write(directory.join("4"), &plain).unwrap();
+    let image = store.original(&original).await.unwrap();
+    assert_eq!(image.quality, ImageQuality::Original);
+    assert_eq!(&image.bytes[..], &plain);
+
+    std::fs::write(directory.join("9"), &plain).unwrap();
+    let full = store
+        .register_forward_image(images, 9, Some("0".repeat(32)))
+        .await
+        .unwrap();
+    let image = store.original(&full).await.unwrap();
+    assert_eq!(image.quality, ImageQuality::Full);
+    assert_eq!(&image.bytes[..], &plain);
+    std::fs::remove_dir_all(account).unwrap();
+}
+
 #[test]
 fn recognizes_voice_formats_without_accepting_html() {
     assert_eq!(

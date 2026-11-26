@@ -509,6 +509,27 @@ async fn merged_forward_keeps_the_actual_nodes_in_the_event_and_quote() {
     );
     drop(records);
 
+    let preview = message(
+        "room@chatroom",
+        "<msg><appmsg><title>群聊的聊天记录</title><des>只有预览</des></appmsg></msg>",
+        49,
+    );
+    runtime.build_event(&preview, "42").await.unwrap();
+    assert_eq!(
+        runtime.cached_message("42").await.unwrap()["message"][0]["type"],
+        "text"
+    );
+    runtime
+        .history_messages
+        .lock()
+        .await
+        .insert("42".into(), event.clone());
+    assert_eq!(
+        runtime.cached_message("42").await.unwrap()["message"],
+        event["message"]
+    );
+    runtime.build_event(&preview, "43").await.unwrap();
+
     let escaped = content
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -527,7 +548,27 @@ async fn merged_forward_keeps_the_actual_nodes_in_the_event_and_quote() {
         segment("reply", json!({ "id": "43" }))
     );
     let cached = runtime.cached_message("43").await.unwrap();
+    assert_eq!(cached["message_seq"], preview.local_id);
     assert_eq!(cached["message"][1]["data"]["text"], context);
+
+    let record = forward::ForwardRecord::parse(content).unwrap();
+    let indexes = record.images().map(|image| image.index).collect::<Vec<_>>();
+    assert_eq!(indexes, [1]);
+    let image = segment(
+        "image",
+        json!({"file":"fixture", "url":"https://example.test/onebot/ws?media=fixture&original=1"}),
+    );
+    let images = HashMap::from([(1, image.clone())]);
+    let nodes = record.onebot(&images);
+    assert_eq!(nodes["message"][1]["data"]["content"][1], image);
+    assert_eq!(
+        nodes["message"][2]["data"]["content"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(record.context(&images).contains("小林：[图片]（图 1）"));
 }
 
 #[tokio::test]

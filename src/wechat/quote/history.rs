@@ -15,13 +15,20 @@ struct HistoryEntry {
     time_labels: Vec<String>,
     searchable: bool,
     is_reply: bool,
+    is_forward: bool,
 }
 
 impl HistoryEntry {
     fn matches_bubble(&self, row: &ListRow) -> bool {
         !self.text.is_empty()
             && (self.text == row.label
-                || (self.is_reply && row.reply_body.as_deref() == Some(self.text.as_str())))
+                || (self.is_reply && row.reply_body.as_deref() == Some(self.text.as_str()))
+                || (self.is_forward
+                    && ["聊天记录", "Chat History"].into_iter().any(|prefix| {
+                        row.label
+                            .strip_prefix(prefix)
+                            .is_some_and(|label| label.trim_start().starts_with(&self.text))
+                    })))
     }
 }
 
@@ -80,6 +87,7 @@ impl QuoteEvidence {
                                 ..
                             }
                         ),
+                        is_forward: message.parsed.is_forward_card(),
                     }
                 })
                 .collect(),
@@ -696,6 +704,7 @@ mod tests {
                     time_labels: vec![format!("10:{minute:02}")],
                     searchable: true,
                     is_reply: false,
+                    is_forward: false,
                 })
                 .collect(),
             target,
@@ -728,6 +737,29 @@ mod tests {
             "文件传输助手"
         ));
         assert!(!is_history_title("\"测试裙2\"的聊天记录(4)", "测试裙"));
+    }
+
+    #[test]
+    fn forward_cards_with_identical_previews_are_anchored_by_the_chat_timeline() {
+        let title = "群聊的聊天记录";
+        let mut evidence = entries(&[(title, 12), (title, 14)], 1);
+        for entry in &mut evidence.entries {
+            entry.is_forward = true;
+        }
+        let first = row("聊天记录群聊的聊天记录群友: [图片]", 10);
+        let second = row(&first.label, 78);
+        let bubbles = [
+            Bubble {
+                clock: Some("10:12"),
+                row: &first,
+            },
+            Bubble {
+                clock: Some("10:14"),
+                row: &second,
+            },
+        ];
+        assert_eq!(evidence.candidate(&bubbles, None), Some(1));
+        assert_eq!(evidence.candidate(&bubbles[..1], None), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::emoji_media_from_connection;
 use super::{
-    account_wxid, build_single_table_meta, image_receipt_matches, media_content_pending,
+    account_wxid, build_single_table_meta, image_receipt_matches, message_content_pending,
     message_is_self, message_sender, normalize_group_message, parse_msg_content,
     sent_message_matches, session_updates_from_rows, sticker_receipt_matches, DbMessage,
     MsgContent, SessionCursor, SessionMessage,
@@ -23,6 +23,17 @@ pub(super) fn open_fixture_database(path: &std::path::Path, key: &[u8]) -> rusql
         .execute_batch("PRAGMA cipher_compatibility=4;")
         .unwrap();
     connection
+}
+
+#[test]
+fn forward_cache_id_requires_the_record_field_and_a_safe_unique_name() {
+    use super::history::record_cache_id;
+
+    let valid = b"\x08\x03\x10\x02\x4a\x12\x0a\x10abcd0123456789ef\x58\x00";
+    assert_eq!(record_cache_id(valid), Some("abcd0123456789ef"));
+    assert!(record_cache_id(b"abcd0123456789ef").is_none());
+    assert!(record_cache_id(b"\x4a\x12\x0a\x10../../0123456789").is_none());
+    assert!(record_cache_id(&[valid.as_slice(), valid].concat()).is_none());
 }
 
 #[tokio::test]
@@ -715,6 +726,146 @@ async fn media_rows_wait_for_wechat_to_finish_writing_before_advancing_the_curso
 }
 
 #[test]
+fn merged_forward_preview_detection_ignores_links_and_replies() {
+    let link = "<msg><appmsg><title>群聊的聊天记录</title><type>5</type>\
+        <url>https://example.test/article</url></appmsg></msg>";
+    assert!(!message_content_pending(49, link, false));
+    let other_template = "<msg><appmsg><title>群聊的聊天记录</title><type>40</type>\
+        <url>https://support.weixin.qq.com/security/readtemplate?t=other</url></appmsg></msg>";
+    assert!(!message_content_pending(49, other_template, false));
+    let other_host = "<msg><appmsg><title>群聊的聊天记录</title><type>40</type>\
+        <url>https://support.weixin.qq.com.example.test/security/readtemplate?t=w_security_center_website/upgrade\
+        </url></appmsg></msg>";
+    assert!(!message_content_pending(49, other_host, false));
+    let reply = "<msg><appmsg><title>看看他的聊天记录</title><type>57</type></appmsg></msg>";
+    assert!(!message_content_pending(49, reply, false));
+}
+
+#[test]
+fn merged_forward_preview_accepts_wechat_fallback_query_variants() {
+    for (app_type, url) in [
+        (5, "https://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade"),
+        (40, "https://support.weixin.qq.com/security/readtemplate?wechat_real_lang=zh_CN&amp;t=w_security_center_website%2Fupgrade"),
+        (40, "https://support.weixin.qq.com/cgi-bin/mmsupport-bin/readtemplate?t=page/favorite_record__w_unsupport&amp;wechat_real_lang=zh_CN"),
+    ] {
+        let content = format!(
+            "<msg><appmsg><title>群聊的聊天记录</title><type>{app_type}</type>\
+             <url>{url}</url></appmsg></msg>"
+        );
+        assert!(message_content_pending(49, &content, false), "{url}");
+    }
+}
+
+#[tokio::test]
+async fn merged_forward_preview_waits_for_the_complete_record() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE Name2Id (user_name TEXT NOT NULL);
+             INSERT INTO Name2Id (rowid, user_name) VALUES (1, 'wxid_friend');
+             CREATE TABLE ChatMsg_1 (
+                 local_id INTEGER PRIMARY KEY, server_id INTEGER, create_time INTEGER,
+                 message_content TEXT, local_type INTEGER, real_sender_id INTEGER
+             );",
+        )
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let preview_kind = (40_i64 << 32) | 49;
+    let forward_kind = (19_i64 << 32) | 49;
+    let preview = "<msg><appmsg><title>群聊的聊天记录</title><des>只有预览</des><type>40</type>\
+        <url><![CDATA[https://support.weixin.qq.com/security/readtemplate?t=w_security_center_website/upgrade&wechat_real_lang=zh_CN]]>\
+        </url></appmsg></msg>";
+    assert!(matches!(
+        super::parse_msg_content(preview_kind, preview),
+        super::MsgContent::App {
+            app_type: Some(40),
+            ..
+        }
+    ));
+    connection
+        .execute(
+            "INSERT INTO ChatMsg_1 VALUES (1, 501, ?1, ?2, ?3, 1)",
+            rusqlite::params![now, preview, preview_kind],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO ChatMsg_1 VALUES (2, 502, ?1, '后续发言', 1, 1)",
+            [now],
+        )
+        .unwrap();
+    let connection = std::sync::Arc::new(std::sync::Mutex::new(connection));
+    let manager = super::DbManager::new(
+        "0".repeat(64),
+        std::path::PathBuf::from("wxid_self_0000/db_storage"),
+    )
+    .unwrap();
+    manager
+        .msg_conns
+        .lock()
+        .unwrap()
+        .insert("message/message_0.db".into(), connection.clone());
+
+    assert!(manager.get_new_messages().await.unwrap().is_empty());
+    assert!(manager.watermarks.lock().await.is_empty());
+
+    let nodes: String = (1..=97)
+        .map(|index| {
+            format!(
+                "<dataitem datatype=\"1\"><sourcename>群友</sourcename>\
+                 <datadesc>第{index}条正文</datadesc></dataitem>"
+            )
+        })
+        .collect();
+    let record = format!(
+        "<msg><appmsg><title>群聊的聊天记录</title>\
+         <recorditem><![CDATA[<recordinfo><datalist count=\"97\">{nodes}</datalist>\
+         </recordinfo>]]></recorditem></appmsg></msg>"
+    );
+    connection
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE ChatMsg_1 SET message_content=?1, local_type=?2 WHERE local_id=1",
+            rusqlite::params![record, forward_kind],
+        )
+        .unwrap();
+    let messages = manager.get_new_messages().await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].server_id, 501);
+    assert_eq!(messages[1].server_id, 502);
+    let runtime = crate::onebot::OneBotRuntime::new("wxid_self".into(), "机器人".into(), None);
+    let event = runtime.event_from_message(&messages[0]).await.unwrap();
+    assert_eq!(event["message_type"], "private");
+    assert_eq!(event["message"][0]["type"], "forward");
+    let context = event["message"][1]["data"]["text"].as_str().unwrap();
+    assert_eq!(context.lines().count(), 99);
+    assert!(context.contains("第97条正文"));
+    assert!(manager.get_new_messages().await.unwrap().is_empty());
+
+    connection
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO ChatMsg_1 VALUES (3, 503, ?1, ?2, ?3, 1)",
+            rusqlite::params![now - 60, preview, preview_kind],
+        )
+        .unwrap();
+    let messages = manager.get_new_messages().await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].server_id, 503);
+    let expired_preview = runtime.event_from_message(&messages[0]).await.unwrap();
+    let text = expired_preview["message"][0]["data"]["text"]
+        .as_str()
+        .unwrap();
+    assert!(text.contains("[聊天记录正文暂不可用]"));
+    assert!(!text.contains("https://"));
+}
+
+#[test]
 fn reads_favorite_emoji_media_by_checksum_without_changing_the_database() {
     let connection = rusqlite::Connection::open_in_memory().unwrap();
     connection
@@ -894,13 +1045,13 @@ fn sticker_confirmation_requires_the_native_type_and_matching_checksum() {
 fn outgoing_sticker_placeholders_wait_for_the_file_to_be_imported() {
     let placeholder = "<msg><emoji md5=\"\" type=\"2\" len=\"0\" /></msg>";
     let complete = "<msg><emoji md5=\"abcdef0123456789abcdef0123456789\" /></msg>";
-    assert!(media_content_pending(47, placeholder, true));
-    assert!(media_content_pending(47, "<msg><emoji /></msg>", true));
-    assert!(!media_content_pending(47, complete, true));
-    assert!(!media_content_pending(47, placeholder, false));
-    assert!(media_content_pending(3, "", true));
-    assert!(media_content_pending(47, "", false));
-    assert!(!media_content_pending(1, "", true));
+    assert!(message_content_pending(47, placeholder, true));
+    assert!(message_content_pending(47, "<msg><emoji /></msg>", true));
+    assert!(!message_content_pending(47, complete, true));
+    assert!(!message_content_pending(47, placeholder, false));
+    assert!(message_content_pending(3, "", true));
+    assert!(message_content_pending(47, "", false));
+    assert!(!message_content_pending(1, "", true));
 }
 
 #[test]

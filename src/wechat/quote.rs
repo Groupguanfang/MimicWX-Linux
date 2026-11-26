@@ -4,6 +4,7 @@ use crate::db::QuoteHistory;
 use crate::input::InputEngine;
 use anyhow::{bail, Context, Result};
 
+mod forward;
 mod history;
 use history::QuoteEvidence;
 
