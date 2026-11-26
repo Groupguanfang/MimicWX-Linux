@@ -7,13 +7,13 @@
 //!   wxauto: wx.AddListenChat("张三") → 弹出独立窗口 → ChatWnd("张三")
 //!   MimicWX: POST /listen {"who":"张三"} → 双击弹出 → ChatWnd 实例化
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::atspi::{AtSpi, NodeRef, SearchAction};
 use crate::input::InputEngine;
-use crate::wechat::{ChatMessage, ms, parse_message_item};
+use crate::wechat::{ms, parse_message_item, ChatMessage};
 
 // =====================================================================
 // ChatWnd — 独立聊天窗口
@@ -79,15 +79,25 @@ impl ChatWnd {
             return; // 已缓存
         }
         let win = self.window_node.clone();
-        if let Some(node) = self.atspi.find_dfs(&win, &|role, _| {
-            if role == "entry" || role == "text" {
-                SearchAction::Found
-            } else if role == "list" {
-                SearchAction::Skip // 跳过消息列表
-            } else {
-                SearchAction::Recurse
-            }
-        }, 0, 15, 30).await {
+        if let Some(node) = self
+            .atspi
+            .find_dfs(
+                &win,
+                &|role, _| {
+                    if role == "entry" || role == "text" {
+                        SearchAction::Found
+                    } else if role == "list" {
+                        SearchAction::Skip // 跳过消息列表
+                    } else {
+                        SearchAction::Recurse
+                    }
+                },
+                0,
+                15,
+                30,
+            )
+            .await
+        {
             info!("📌 [ChatWnd] 缓存输入框节点: {}", self.who);
             self.edit_box_node = Some(node);
         } else {
@@ -101,15 +111,29 @@ impl ChatWnd {
             return;
         }
         let win = self.window_node.clone();
-        if let Some(node) = self.atspi.find_dfs(&win, &|role, name| {
-            if role == "list" && (name.contains("消息") || name.contains("Messages") || name.contains("Message")) {
-                SearchAction::Found
-            } else if role == "list" {
-                SearchAction::Skip // 跳过其他 list
-            } else {
-                SearchAction::Recurse
-            }
-        }, 0, 15, 30).await {
+        if let Some(node) = self
+            .atspi
+            .find_dfs(
+                &win,
+                &|role, name| {
+                    if role == "list"
+                        && (name.contains("消息")
+                            || name.contains("Messages")
+                            || name.contains("Message"))
+                    {
+                        SearchAction::Found
+                    } else if role == "list" {
+                        SearchAction::Skip // 跳过其他 list
+                    } else {
+                        SearchAction::Recurse
+                    }
+                },
+                0,
+                15,
+                30,
+            )
+            .await
+        {
             info!("📌 [ChatWnd] 缓存消息列表节点: {}", self.who);
             self.msg_list_node = Some(node);
         } else {
@@ -123,16 +147,20 @@ impl ChatWnd {
 
     /// 在此独立窗口中查找消息列表
     pub async fn find_message_list(&self) -> Option<NodeRef> {
-        self.atspi.find_bfs(&self.window_node, |role, name| {
-            role == "list" && (name.contains("消息") || name.contains("Messages"))
-        }).await
+        self.atspi
+            .find_bfs(&self.window_node, |role, name| {
+                role == "list" && (name.contains("消息") || name.contains("Messages"))
+            })
+            .await
     }
 
     /// 在此独立窗口中查找输入框
     pub async fn find_edit_box(&self) -> Option<NodeRef> {
-        self.atspi.find_bfs(&self.window_node, |role, _| {
-            role == "entry" || role == "text"
-        }).await
+        self.atspi
+            .find_bfs(&self.window_node, |role, _| {
+                role == "entry" || role == "text"
+            })
+            .await
     }
 
     // =================================================================
@@ -180,10 +208,16 @@ impl ChatWnd {
         };
 
         let count = self.atspi.child_count(&msg_list).await;
-        debug!("[ChatWnd::get_new_messages] {} count={} last_count={}", self.who, count, self.last_count);
+        debug!(
+            "[ChatWnd::get_new_messages] {} count={} last_count={}",
+            self.who, count, self.last_count
+        );
         if count < self.last_count {
             // 消息列表变小了 (窗口重建/消息被清理), 重置
-            debug!("[ChatWnd::get_new_messages] {} count 减少, 重置 last_count", self.who);
+            debug!(
+                "[ChatWnd::get_new_messages] {} count 减少, 重置 last_count",
+                self.who
+            );
             self.last_count = count;
             return Vec::new();
         }
@@ -220,7 +254,10 @@ impl ChatWnd {
 
         let count = self.atspi.child_count(&msg_list).await;
         self.last_count = count;
-        debug!("[ChatWnd::mark_all_read] {} 标记 {} 条消息为已读", self.who, count);
+        debug!(
+            "[ChatWnd::mark_all_read] {} 标记 {} 条消息为已读",
+            self.who, count
+        );
     }
 
     // =================================================================
@@ -243,33 +280,137 @@ impl ChatWnd {
     pub async fn send_message(
         &self,
         engine: &mut InputEngine,
+        app: &NodeRef,
         text: &str,
         skip_verify: bool,
     ) -> Result<(bool, bool, String)> {
         info!("📤 [ChatWnd] 发送: [{}] → {text}", self.who);
+        self.atspi.ensure_no_logout_dialog(app).await?;
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
 
-        // 2. 粘贴消息 (xclip + Ctrl+V)
-        engine.paste_text(text).await?;
-        tokio::time::sleep(ms(300)).await;
+        self.prepare_empty_composer(engine, app).await?;
+        let input_result = if text.contains('@') {
+            let editor = self
+                .edit_box_node
+                .as_ref()
+                .context("独立窗口输入框不可用")?;
+            self.atspi.input_literal_at_text(engine, editor, text).await
+        } else {
+            engine.input_message_text(text).await
+        };
+        if input_result.is_err() || !self.wait_for_message_input(text).await {
+            if let Err(error) = input_result {
+                warn!(error = %error, "⌨️ [ChatWnd] 首次输入未完成，尝试清理残稿后用粘贴重试");
+            }
+            if !self.clear_partial_draft(engine, text).await? {
+                anyhow::bail!("未确认独立窗口输入框的完整内容，已取消发送: {}", self.who);
+            }
+            engine.paste_text(text).await?;
+            if text.contains('@') {
+                engine.dismiss_wechat_member_popup().await?;
+            }
+            if !self.wait_for_message_input(text).await {
+                let _ = self.clear_partial_draft(engine, text).await;
+                anyhow::bail!(
+                    "粘贴后仍未确认独立窗口输入框的完整内容，已取消发送: {}",
+                    self.who
+                );
+            }
+        }
+        self.atspi
+            .ensure_unquoted_composer(&self.window_node)
+            .await?;
+        self.atspi.ensure_no_logout_dialog(app).await?;
 
         // 3. Enter 发送
         engine.press_enter().await?;
-        tokio::time::sleep(ms(500)).await;
+        if !self.wait_for_message_input("").await {
+            anyhow::bail!(
+                "已按发送但未确认独立窗口输入框清空，勿重复发送: {}",
+                self.who
+            );
+        }
 
         // 4. 验证发送 (可跳过, 由 API 层的 DB 验证替代)
         let verified = if skip_verify {
-            debug!("⏩ [ChatWnd] 跳过 AT-SPI 验证 (将由 DB 验证): [{}]", self.who);
+            debug!(
+                "⏩ [ChatWnd] 跳过 AT-SPI 验证 (将由 DB 验证): [{}]",
+                self.who
+            );
             false
         } else {
             self.verify_sent(text).await
         };
 
-        let msg = if verified { "消息已发送" } else { "消息已发送 (未验证)" };
+        let msg = if verified {
+            "消息已发送"
+        } else {
+            "消息已发送 (未验证)"
+        };
         info!("✅ [ChatWnd] 完成: [{}] verified={verified}", self.who);
         Ok((true, verified, msg.into()))
+    }
+
+    async fn wait_for_message_input(&self, expected: &str) -> bool {
+        let Some(editor) = &self.edit_box_node else {
+            return false;
+        };
+        let deadline = tokio::time::Instant::now() + ms(1500);
+        let mut attempt = 0;
+        loop {
+            if attempt > 0 {
+                tokio::time::sleep(ms(50)).await;
+            }
+            attempt += 1;
+            let states = self.atspi.get_states(editor).await;
+            let contents = self.atspi.text(editor).await;
+            let ready = if expected.is_empty() {
+                crate::wechat::empty_input_ready(states, contents.as_deref())
+            } else {
+                crate::wechat::message_input_ready(states, contents.as_deref(), expected)
+            };
+            if ready {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    /// 只清理能确认属于本次输入尝试的残稿。
+    async fn clear_partial_draft(&self, engine: &mut InputEngine, expected: &str) -> Result<bool> {
+        let Some(editor) = &self.edit_box_node else {
+            return Ok(false);
+        };
+        let Some(contents) = self.atspi.text(editor).await else {
+            return Ok(false);
+        };
+        let actual = contents.replace("\r\n", "\n");
+        let expected = expected.replace("\r\n", "\n");
+        let actual_trimmed = actual.trim_end_matches('\n');
+        let expected_trimmed = expected.trim_end_matches('\n');
+        let empty = actual_trimmed.trim().is_empty();
+        let exact = actual_trimmed == expected_trimmed;
+        let partial = !empty && expected_trimmed.starts_with(actual_trimmed);
+        if !empty && !exact && !partial {
+            return Ok(false);
+        }
+        if !empty {
+            let cleared = self.atspi.set_text(editor, "").await
+                && self
+                    .atspi
+                    .text(editor)
+                    .await
+                    .is_some_and(|contents| contents.trim().is_empty());
+            if !cleared {
+                engine.key_combo("ctrl+a").await?;
+                engine.press_key("BackSpace").await?;
+            }
+        }
+        Ok(self.atspi.grab_focus(editor).await && self.wait_for_message_input("").await)
     }
 
     /// 在此独立窗口中发送图片
@@ -279,38 +420,64 @@ impl ChatWnd {
     pub async fn send_image(
         &self,
         engine: &mut InputEngine,
+        app: &NodeRef,
         image_path: &str,
+        sticker: bool,
     ) -> Result<(bool, bool, String)> {
         info!("🖼️ [ChatWnd] 发送图片: [{}] → {image_path}", self.who);
+        self.atspi.ensure_no_logout_dialog(app).await?;
 
         // 1. 激活窗口并聚焦输入框
         self.activate_and_focus_input(engine).await?;
-        if let Some(ref edit_node) = self.edit_box_node {
-            let contents = self.atspi.text(edit_node).await;
-            if !crate::wechat::empty_input_ready(
-                self.atspi.get_states(edit_node).await,
-                contents.as_deref(),
-            ) {
-                anyhow::bail!("独立窗口输入框已有草稿或无法读取，已取消发送图片: {}", self.who);
-            }
-        }
+        self.prepare_empty_composer(engine, app).await?;
 
         // 2. 粘贴图片
-        engine.paste_image(image_path).await?;
+        if sticker {
+            engine.paste_sticker(image_path).await?;
+        } else {
+            engine.paste_image(image_path).await?;
+        }
         tokio::time::sleep(ms(500)).await;
 
         // 3. Enter 发送
+        self.atspi
+            .ensure_unquoted_composer(&self.window_node)
+            .await?;
+        self.atspi.ensure_no_logout_dialog(app).await?;
         engine.press_enter().await?;
         tokio::time::sleep(ms(500)).await;
 
-        info!("✅ [ChatWnd] 图片发送完成: [{}]", self.who);
-        Ok((true, false, "图片已发送 (独立窗口)".into()))
+        let media_type = if sticker { "原生表情" } else { "图片" };
+        info!("✅ [ChatWnd] {media_type}发送完成: [{}]", self.who);
+        Ok((true, false, format!("{media_type}已发送 (独立窗口)")))
+    }
+
+    async fn prepare_empty_composer(&self, engine: &mut InputEngine, app: &NodeRef) -> Result<()> {
+        if !self.wait_for_message_input("").await {
+            anyhow::bail!("独立窗口输入框已有草稿或无法读取，已取消发送: {}", self.who);
+        }
+        if self
+            .atspi
+            .clear_quote_composer(engine, app, &self.window_node)
+            .await?
+        {
+            let focused = if let Some(editor) = &self.edit_box_node {
+                self.atspi.grab_focus(editor).await
+            } else {
+                false
+            };
+            if !focused || !self.wait_for_message_input("").await {
+                anyhow::bail!("清理引用后无法确认独立窗口输入框已聚焦且为空: {}", self.who);
+            }
+        }
+        Ok(())
     }
 
     /// 激活独立窗口并聚焦输入框 (send_message/send_image 的公共前置步骤)
     async fn activate_and_focus_input(&self, engine: &mut InputEngine) -> Result<()> {
         // 1. 将独立窗口提到前台 (X11 _NET_ACTIVE_WINDOW)
-        let activated = engine.activate_window_by_title(&self.who, false)
+        let activated = engine
+            .activate_window_by_title(&self.who, false)
             .unwrap_or(false);
         if !activated {
             // 回退: 点击标题栏

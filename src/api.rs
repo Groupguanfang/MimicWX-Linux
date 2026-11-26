@@ -23,7 +23,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post, delete},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +34,18 @@ use tracing::{info, warn};
 use crate::atspi::AtSpi;
 use crate::db::DbManager;
 use crate::input::InputEngine;
-use crate::wechat::WeChat;
+use crate::wechat::{rendered_text, NativeQuoteTarget, TextPart, WeChat};
+
+mod voice;
+pub use voice::submit_voice_bytes;
+
+struct PendingImageFile(String);
+
+impl Drop for PendingImageFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 // =====================================================================
 // 共享状态
@@ -66,13 +77,21 @@ use tokio::sync::oneshot;
 pub enum InputCommand {
     SendMessage {
         to: String,
-        text: String,
+        parts: Vec<TextPart>,
         skip_verify: bool,
+        quote: Option<NativeQuoteTarget>,
         reply: oneshot::Sender<anyhow::Result<(bool, bool, String)>>,
     },
     SendImage {
         to: String,
         image_path: String,
+        sticker: bool,
+        reply: oneshot::Sender<anyhow::Result<(bool, bool, String)>>,
+    },
+    SendVoice {
+        to: String,
+        path: String,
+        duration_ms: u32,
         reply: oneshot::Sender<anyhow::Result<(bool, bool, String)>>,
     },
     ChatWith {
@@ -99,16 +118,42 @@ pub fn spawn_input_actor(
         info!("🎮 InputEngine actor 已启动");
         while let Some(cmd) = rx.recv().await {
             match cmd {
-                InputCommand::SendMessage { to, text, skip_verify, reply } => {
-                    let result = wechat.send_message(&mut engine, &to, &text, skip_verify).await;
+                InputCommand::SendMessage {
+                    to,
+                    parts,
+                    skip_verify,
+                    quote,
+                    reply,
+                } => {
+                    let result = wechat
+                        .send_message(&mut engine, &to, &parts, skip_verify, quote.as_ref())
+                        .await;
                     let _ = reply.send(result);
                 }
-                InputCommand::SendImage { to, image_path, reply } => {
-                    let result = wechat.send_image(&mut engine, &to, &image_path).await;
+                InputCommand::SendImage {
+                    to,
+                    image_path,
+                    sticker,
+                    reply,
+                } => {
+                    let result = wechat
+                        .send_image(&mut engine, &to, &image_path, sticker)
+                        .await;
                     let _ = reply.send(result);
                 }
                 InputCommand::ChatWith { who, reply } => {
                     let result = wechat.chat_with(&mut engine, &who).await;
+                    let _ = reply.send(result);
+                }
+                InputCommand::SendVoice {
+                    to,
+                    path,
+                    duration_ms,
+                    reply,
+                } => {
+                    let result = wechat
+                        .send_voice(&mut engine, &to, &path, duration_ms)
+                        .await;
                     let _ = reply.send(result);
                 }
                 InputCommand::AddListen { who, reply } => {
@@ -176,10 +221,16 @@ struct ApiError {
 
 impl ApiError {
     fn unavailable(msg: impl Into<String>) -> Self {
-        Self { status: StatusCode::SERVICE_UNAVAILABLE, message: msg.into() }
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
     }
     fn internal(msg: impl Into<String>) -> Self {
-        Self { status: StatusCode::INTERNAL_SERVER_ERROR, message: msg.into() }
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: msg.into(),
+        }
     }
 }
 
@@ -258,7 +309,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route_layer(middleware::from_fn_with_state(state.clone(), auth_layer));
 
     // 免认证路由
-    let router = Router::new().route("/status", get(get_status)).merge(protected);
+    let router = Router::new()
+        .route("/status", get(get_status))
+        .merge(protected);
 
     // OneBot 11 使用独立 Bearer Token 校验；该路径可由懒猫 public_path 放行。
     let router = if state.onebot.is_some() {
@@ -310,6 +363,7 @@ fn default_image_name() -> String {
 pub struct SendResponse {
     pub sent: bool,
     pub verified: bool,
+    pub confirmation_pending: bool,
     pub message: String,
 }
 
@@ -345,18 +399,26 @@ async fn get_status(State(state): State<Arc<AppState>>) -> Json<StatusResponse> 
     let db_available = state.db.is_some();
     let contacts = if let Some(ref d) = state.db {
         d.get_contacts().await.len()
-    } else { 0 };
+    } else {
+        0
+    };
     let uptime_secs = state.start_time.elapsed().as_secs();
     Json(StatusResponse {
         status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").into(),
-        listen_count, db_available, contacts, uptime_secs,
+        listen_count,
+        db_available,
+        contacts,
+        uptime_secs,
     })
 }
 
 /// 联系人列表 (从数据库)
 async fn get_contacts(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
-    let db = state.db.as_ref().ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
+    let db = state
+        .db
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("数据库不可用"))?;
     let contacts = db.get_contacts().await;
     Ok(Json(serde_json::json!({ "contacts": contacts })))
 }
@@ -386,11 +448,33 @@ pub async fn send_text(
     to: &str,
     text: &str,
 ) -> Result<SendResponse, String> {
+    send_text_with_confirmation(state, to, vec![TextPart::Text(text.to_owned())], true, None).await
+}
+
+pub(crate) async fn submit_text(
+    state: &Arc<AppState>,
+    to: &str,
+    parts: Vec<TextPart>,
+    quote: Option<NativeQuoteTarget>,
+) -> Result<SendResponse, String> {
+    send_text_with_confirmation(state, to, parts, false, quote).await
+}
+
+async fn send_text_with_confirmation(
+    state: &Arc<AppState>,
+    to: &str,
+    parts: Vec<TextPart>,
+    wait_for_confirmation: bool,
+    quote: Option<NativeQuoteTarget>,
+) -> Result<SendResponse, String> {
     // DB 可用时跳过 AT-SPI 验证, 由下面的 DB 验证替代
     let has_db = state.db.is_some();
 
     let expected_chat = if let Some(db) = &state.db {
-        let matches: Vec<_> = db.get_contacts().await.into_iter()
+        let matches: Vec<_> = db
+            .get_contacts()
+            .await
+            .into_iter()
             .filter(|contact| contact.username == to || contact.display_name == to)
             .collect();
         if matches.len() != 1 {
@@ -403,37 +487,57 @@ pub async fn send_text(
 
     // 在发送前订阅自发消息广播 (避免竞态: 发送期间的广播不会丢失)
     let sent_rx = state.db.as_ref().map(|db| db.subscribe_sent());
+    let quote_id = quote.as_ref().map(|target| target.server_id.clone());
+    let text = rendered_text(&parts);
+    let mention_ids = parts
+        .iter()
+        .filter_map(|part| match part {
+            TextPart::Mention { id, .. } => Some(id.clone()),
+            TextPart::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
 
     // 发送命令到 actor
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::SendMessage {
-        to: to.to_string(),
-        text: text.to_string(),
-        skip_verify: has_db,
-        reply: reply_tx,
-    }).await.map_err(|_| "InputEngine actor 已停止".to_string())?;
+    state
+        .input_tx
+        .send(InputCommand::SendMessage {
+            to: to.to_string(),
+            parts,
+            skip_verify: has_db,
+            quote,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| "InputEngine actor 已停止".to_string())?;
 
     match reply_rx.await {
         Ok(Ok((sent, atspi_verified, message))) => {
-            // DB 验证 (优先): DB 可用时用已订阅的 receiver 等待匹配
-            let verified = if !sent {
-                false
-            } else if let Some(rx) = sent_rx {
-                state.db.as_ref().unwrap()
-                    .verify_sent(expected_chat.as_deref().unwrap_or(to), text, rx).await
+            let chat = expected_chat.unwrap_or_else(|| to.to_string());
+            let text_owned = text.clone();
+            let verification = state.db.clone().zip(sent_rx).map(|(db, rx)| async move {
+                db.verify_sent(&chat, &text_owned, quote_id.as_deref(), &mention_ids, rx)
+                    .await
                     .unwrap_or(atspi_verified)
-            } else {
-                atspi_verified
-            };
-
-            let msg_json = serde_json::json!({
+            });
+            let event = serde_json::json!({
                 "type": "sent",
                 "to": to,
                 "text": text,
-                "verified": verified,
             });
-            let _ = state.tx.send(msg_json.to_string());
-            Ok(SendResponse { sent, verified, message })
+            Ok(finish_send(
+                SendResponse {
+                    sent,
+                    verified: sent && atspi_verified,
+                    confirmation_pending: false,
+                    message,
+                },
+                verification,
+                wait_for_confirmation,
+                state.tx.clone(),
+                event,
+            )
+            .await)
         }
         Ok(Err(e)) => Err(format!("发送失败: {e}")),
         Err(_) => Err("actor 响应通道已关闭".to_string()),
@@ -469,6 +573,39 @@ pub async fn send_image_bytes(
     to: &str,
     image_data: Vec<u8>,
 ) -> Result<SendResponse, String> {
+    send_image_with_confirmation(state, to, image_data, true, false).await
+}
+
+pub async fn submit_image_bytes(
+    state: &Arc<AppState>,
+    to: &str,
+    image_data: Vec<u8>,
+) -> Result<SendResponse, String> {
+    send_image_with_confirmation(state, to, image_data, false, false).await
+}
+
+pub async fn submit_sticker_bytes(
+    state: &Arc<AppState>,
+    to: &str,
+    image_data: Vec<u8>,
+) -> Result<SendResponse, String> {
+    if state.db.is_none() {
+        return Err("原生表情发送需要数据库回执，数据库尚未就绪".into());
+    }
+    let gif = crate::sticker::prepare(&image_data)
+        .await
+        .map_err(|error| format!("准备原生表情失败: {error:#}"))?;
+    send_image_with_confirmation(state, to, gif, false, true).await
+}
+
+async fn send_image_with_confirmation(
+    state: &Arc<AppState>,
+    to: &str,
+    image_data: Vec<u8>,
+    wait_for_confirmation: bool,
+    sticker: bool,
+) -> Result<SendResponse, String> {
+    let sticker_checksum = sticker.then(|| format!("{:x}", md5::compute(&image_data)));
     let receipt_rx = state.db.as_ref().map(|db| db.subscribe_received());
     let expected_chat = if let Some(db) = &state.db {
         let matches: Vec<_> = db
@@ -492,43 +629,120 @@ pub async fn send_image_bytes(
         "bmp"
     } else if image_data.starts_with(b"RIFF") {
         "webp"
-    } else { "png" };
-    let tmp_path = format!("/tmp/mimicwx_img_{}_{:04x}.{ext}",
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-        rand_u16());
-    tokio::fs::write(&tmp_path, image_data).await
+    } else {
+        "png"
+    };
+    let tmp_path = format!(
+        "/tmp/mimicwx_img_{}_{:04x}.{ext}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        rand_u16()
+    );
+    tokio::fs::write(&tmp_path, image_data)
+        .await
         .map_err(|error| format!("写入图片失败: {error}"))?;
+    let pending_file = PendingImageFile(tmp_path.clone());
     let started_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     let (reply_tx, reply_rx) = oneshot::channel();
-    let queued = state.input_tx.send(InputCommand::SendImage {
-        to: to.to_string(),
-        image_path: tmp_path.clone(),
-        reply: reply_tx,
-    }).await;
+    let queued = state
+        .input_tx
+        .send(InputCommand::SendImage {
+            to: to.to_string(),
+            image_path: tmp_path.clone(),
+            sticker,
+            reply: reply_tx,
+        })
+        .await;
     let result = if queued.is_ok() {
-        reply_rx.await.map_err(|_| "actor 响应通道已关闭".to_string())
+        reply_rx
+            .await
+            .map_err(|_| "actor 响应通道已关闭".to_string())
             .and_then(|response| response.map_err(|error| format!("发送图片失败: {error}")))
     } else {
         Err("InputEngine actor 已停止".to_string())
     };
-    let _ = tokio::fs::remove_file(&tmp_path).await;
     let (sent, atspi_verified, message) = result?;
-    let verified = if !sent {
-        false
-    } else if let (Some(db), Some(receipts), Some(expected_chat)) =
-        (state.db.as_ref(), receipt_rx, expected_chat)
-    {
-        db.verify_image_sent(&expected_chat, started_at, receipts)
-            .await
-            .unwrap_or(atspi_verified)
-    } else {
-        atspi_verified
-    };
-    Ok(SendResponse { sent, verified, message })
+    let verification = state.db.clone().zip(receipt_rx).zip(expected_chat).map(
+        |((db, receipts), chat)| async move {
+            let _pending_file = pending_file;
+            if let Some(checksum) = sticker_checksum {
+                db.verify_sticker_sent(&chat, started_at, &checksum, receipts)
+                    .await
+                    .unwrap_or(false)
+            } else {
+                db.verify_image_sent(&chat, started_at, receipts)
+                    .await
+                    .unwrap_or(atspi_verified)
+            }
+        },
+    );
+    Ok(finish_send(
+        SendResponse {
+            sent,
+            verified: sent && atspi_verified,
+            confirmation_pending: false,
+            message,
+        },
+        verification,
+        wait_for_confirmation,
+        state.tx.clone(),
+        serde_json::json!({
+            "type": "sent", "to": to,
+            "media_type": if sticker { "sticker" } else { "image" },
+        }),
+    )
+    .await)
 }
+
+async fn finish_send(
+    mut response: SendResponse,
+    verification: Option<impl std::future::Future<Output = bool> + Send + 'static>,
+    wait_for_confirmation: bool,
+    events: broadcast::Sender<String>,
+    mut event: serde_json::Value,
+) -> SendResponse {
+    let mut deferred = None;
+    if response.sent {
+        if let Some(verification) = verification {
+            if wait_for_confirmation {
+                response.verified = verification.await;
+            } else {
+                response.confirmation_pending = true;
+                deferred = Some(verification);
+            }
+        }
+    }
+    event["sent"] = serde_json::json!(response.sent);
+    event["verified"] = serde_json::json!(response.verified);
+    event["confirmation_pending"] = serde_json::json!(response.confirmation_pending);
+    let _ = events.send(event.to_string());
+    if let Some(verification) = deferred {
+        tokio::spawn(async move {
+            let verified = verification.await;
+            event["type"] = serde_json::json!("send_confirmation");
+            event["verified"] = serde_json::json!(verified);
+            event["confirmation_pending"] = serde_json::json!(false);
+            if verified {
+                info!("✅ 后台发送确认: {}", event["to"]);
+            } else {
+                warn!(
+                    "⚠️ 后台发送未确认，请检查微信实际结果，不自动重发: {}",
+                    event["to"]
+                );
+            }
+            let _ = events.send(event.to_string());
+        });
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests;
 
 async fn get_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // 优先使用数据库
@@ -550,14 +764,24 @@ async fn chat_with(
     Json(req): Json<ChatRequest>,
 ) -> Result<Json<ChatResponse>, ApiError> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::ChatWith {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::ChatWith {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     match reply_rx.await {
-        Ok(Ok(Some(name))) => Ok(Json(ChatResponse { success: true, chat_name: Some(name) })),
-        Ok(Ok(None)) => Ok(Json(ChatResponse { success: false, chat_name: None })),
+        Ok(Ok(Some(name))) => Ok(Json(ChatResponse {
+            success: true,
+            chat_name: Some(name),
+        })),
+        Ok(Ok(None)) => Ok(Json(ChatResponse {
+            success: false,
+            chat_name: None,
+        })),
         Ok(Err(e)) => Err(ApiError::internal(format!("切换聊天失败: {e}"))),
         Err(_) => Err(ApiError::internal("actor 响应通道已关闭")),
     }
@@ -568,10 +792,14 @@ async fn add_listen(
     Json(req): Json<ListenRequest>,
 ) -> Result<Json<ListenResponse>, ApiError> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    state.input_tx.send(InputCommand::AddListen {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await.map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
+    state
+        .input_tx
+        .send(InputCommand::AddListen {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| ApiError::unavailable("InputEngine actor 已停止"))?;
 
     match reply_rx.await {
         Ok(Ok(true)) => Ok(Json(ListenResponse {
@@ -592,10 +820,13 @@ async fn remove_listen(
     Json(req): Json<ListenRequest>,
 ) -> Json<ListenResponse> {
     let (reply_tx, reply_rx) = oneshot::channel();
-    let sent = state.input_tx.send(InputCommand::RemoveListen {
-        who: req.who.clone(),
-        reply: reply_tx,
-    }).await;
+    let sent = state
+        .input_tx
+        .send(InputCommand::RemoveListen {
+            who: req.who.clone(),
+            reply: reply_tx,
+        })
+        .await;
 
     let removed = if sent.is_ok() {
         reply_rx.await.unwrap_or(false)
@@ -641,7 +872,8 @@ async fn get_tree(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let max_depth = params.get("depth")
+    let max_depth = params
+        .get("depth")
         .and_then(|d| d.parse::<u32>().ok())
         .unwrap_or(5)
         .min(15);
@@ -664,10 +896,7 @@ async fn get_session_tree(State(state): State<Arc<AppState>>) -> impl IntoRespon
     Json(vec![])
 }
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws(socket, state))
 }
 

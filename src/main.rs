@@ -8,19 +8,22 @@
 //! - db: 数据库监听 (SQLCipher 解密 + fanotify WAL 监听)
 //! - api: HTTP/WebSocket API
 
-mod atspi;
 mod api;
+mod atspi;
+mod audio;
 mod chatwnd;
 mod db;
 mod input;
 mod onebot;
+mod sticker;
+mod typing;
 mod wechat;
 
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 // =====================================================================
@@ -35,6 +38,8 @@ struct AppConfig {
     listen: ListenConfig,
     #[serde(default)]
     onebot: OneBotConfig,
+    #[serde(default)]
+    typing: typing::TypingConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -59,6 +64,10 @@ struct OneBotConfig {
     /// OneBot 鉴权 Token；留空时复用 [api].token
     #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
+    media_url: Option<String>,
+    #[serde(default)]
+    reverse: Vec<onebot::ReverseConfig>,
 }
 
 /// 加载配置文件 (搜索多个路径)
@@ -124,7 +133,7 @@ async fn main() -> Result<()> {
     };
 
     // ③ X11 XTEST 输入引擎 (仅发送消息需要, 非必须)
-    let engine = match input::InputEngine::new() {
+    let engine = match input::InputEngine::new(config.typing) {
         Ok(e) => {
             info!("✅ X11 XTEST 输入引擎就绪");
             Some(e)
@@ -236,14 +245,30 @@ async fn main() -> Result<()> {
 
     let api_token = config.api.token.filter(|token| !token.is_empty());
     let onebot_runtime = if config.onebot.enabled {
-        let token = config.onebot.token.filter(|token| !token.is_empty()).or(api_token.clone());
+        let token = config
+            .onebot
+            .token
+            .filter(|token| !token.is_empty())
+            .or(api_token.clone());
         match db_manager.as_ref() {
             Some(db) if token.is_some() && db.self_wxid().starts_with("wxid_") => {
-                Some(onebot::OneBotRuntime::new(
-                    db.self_wxid().to_string(),
-                    db.self_display_name().await,
-                    token,
-                ))
+                let runtime = if let Some(media_url) = config.onebot.media_url {
+                    onebot::OneBotRuntime::with_media_url(
+                        db.self_wxid().to_string(),
+                        db.self_display_name().await,
+                        token,
+                        media_url,
+                        Some(Arc::clone(db)),
+                    )
+                    .map_err(anyhow::Error::msg)?
+                } else {
+                    onebot::OneBotRuntime::new(
+                        db.self_wxid().to_string(),
+                        db.self_display_name().await,
+                        token,
+                    )
+                };
+                Some(runtime)
             }
             _ => {
                 warn!("OneBot 暂未启用：请配置 Token，并在登录微信、数据库就绪后重启 MimicWX");
@@ -295,6 +320,12 @@ async fn main() -> Result<()> {
     // 关闭信号 (Ctrl+C 或 /restart 触发)
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let shutdown_tx_clone = shutdown_tx.clone();
+
+    if let Some(runtime) = &onebot_runtime {
+        for endpoint in config.onebot.reverse {
+            endpoint.spawn(state.clone(), runtime.clone(), shutdown_tx.subscribe());
+        }
+    }
 
     // 保留 db_manager 引用给控制台命令使用 (db_manager 会被下面的 if let 消费)
     let console_db_ref = db_manager.clone();
@@ -363,18 +394,19 @@ async fn main() -> Result<()> {
             });
         }
 
-        // 启动 WAL fanotify 监听 (PID 过滤, 无需防抖)
+        // 启动 WAL inotify 监听
         let mut wal_rx = db.spawn_wal_watcher();
 
+        // 快照模式下不再保持 session.db 的实时连接。消息统一由 message_N.db
+        // 的 WAL 事件驱动，避免与微信 WCDB 共享 -shm 索引。
+
         tokio::spawn(async move {
-            info!("👂 数据库消息监听启动 (fanotify PID 过滤)");
+            info!("👂 数据库消息监听启动 (inotify，独立只读快照)");
 
             loop {
-                // 等待 WAL 变化通知 (fanotify 已过滤自身事件, 无需防抖)
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    wal_rx.recv(),
-                ).await {
+                // 等待 WAL 变化通知
+                match tokio::time::timeout(std::time::Duration::from_secs(30), wal_rx.recv()).await
+                {
                     Ok(Ok(())) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
                     Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                         error!("❌ WAL 监听通道关闭");
@@ -384,6 +416,7 @@ async fn main() -> Result<()> {
                         // 30s 超时也执行一次轮询 (fallback)
                     }
                 }
+                while wal_rx.try_recv().is_ok() {}
 
                 // 拉取新消息
                 match db.get_new_messages().await {
@@ -453,10 +486,14 @@ async fn main() -> Result<()> {
 
             for target in &auto_targets {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-                if auto_input_tx.send(api::InputCommand::AddListen {
-                    who: target.clone(),
-                    reply: reply_tx,
-                }).await.is_err() {
+                if auto_input_tx
+                    .send(api::InputCommand::AddListen {
+                        who: target.clone(),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .is_err()
+                {
                     warn!("⚠️ InputEngine actor 已停止, 无法自动添加监听");
                     break;
                 }
@@ -480,7 +517,13 @@ async fn main() -> Result<()> {
         let console_shutdown = shutdown_tx.clone();
         let console_wechat = wechat.clone();
         tokio::spawn(async move {
-            console_loop(console_exit, console_shutdown, console_wechat, console_db_ref).await;
+            console_loop(
+                console_exit,
+                console_shutdown,
+                console_wechat,
+                console_db_ref,
+            )
+            .await;
         });
     }
 
@@ -492,9 +535,8 @@ async fn main() -> Result<()> {
 
     // 优雅退出: 监听 shutdown 信号 + Ctrl+C
     let mut shutdown_rx = shutdown_tx_clone.subscribe();
-    let mut restart_signal = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::hangup(),
-    )?;
+    let mut restart_signal =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let restart_exit_code = exit_code.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -551,7 +593,8 @@ fn find_db_dir() -> Option<PathBuf> {
                 let db_storage = entry.path().join("db_storage");
                 if db_storage.exists() {
                     let msg_dir = db_storage.join("message");
-                    let mtime = msg_dir.metadata()
+                    let mtime = msg_dir
+                        .metadata()
                         .and_then(|m| m.modified())
                         .unwrap_or(std::time::UNIX_EPOCH);
                     debug!("📂 候选: {} (mtime={:?})", db_storage.display(), mtime);
@@ -566,7 +609,11 @@ fn find_db_dir() -> Option<PathBuf> {
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         let chosen = &candidates[0].0;
         if candidates.len() > 1 {
-            info!("📂 发现 {} 个账号目录, 选择最新的: {}", candidates.len(), chosen.display());
+            info!(
+                "📂 发现 {} 个账号目录, 选择最新的: {}",
+                candidates.len(),
+                chosen.display()
+            );
         } else {
             info!("📂 数据库目录: {}", chosen.display());
         }
@@ -598,7 +645,9 @@ struct RawModeGuard(libc::termios);
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.0); }
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &self.0);
+        }
         let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
@@ -608,12 +657,16 @@ impl Drop for RawModeGuard {
 fn enable_raw_mode() -> Option<RawModeGuard> {
     unsafe {
         let mut orig: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 { return None; }
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut orig) != 0 {
+            return None;
+        }
         let mut raw = orig;
         raw.c_lflag &= !(libc::ICANON | libc::ECHO);
         raw.c_cc[libc::VMIN] = 1;
         raw.c_cc[libc::VTIME] = 0;
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0 { return None; }
+        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw) != 0 {
+            return None;
+        }
         Some(RawModeGuard(orig))
     }
 }
@@ -624,38 +677,49 @@ fn redraw_prompt(line: &str, cursor: usize) {
     let mut out = std::io::stdout().lock();
     let _ = write!(out, "\r\x1b[K> {}", line);
     let move_back = line[cursor..].chars().count();
-    if move_back > 0 { let _ = write!(out, "\x1b[{}D", move_back); }
+    if move_back > 0 {
+        let _ = write!(out, "\x1b[{}D", move_back);
+    }
     let _ = out.flush();
 }
 
 /// 处理控制台命令, 返回 true = 应退出
 async fn handle_command(
-    cmd: &str, exit_code: &Arc<AtomicI32>,
+    cmd: &str,
+    exit_code: &Arc<AtomicI32>,
     shutdown_tx: &tokio::sync::broadcast::Sender<()>,
-    wechat: &Arc<wechat::WeChat>, db: &Option<Arc<db::DbManager>>,
+    wechat: &Arc<wechat::WeChat>,
+    db: &Option<Arc<db::DbManager>>,
 ) -> bool {
     match cmd {
         "/restart" => {
             info!("🔄 收到 /restart 命令, 准备重启...");
             exit_code.store(42, Ordering::Relaxed);
-            let _ = shutdown_tx.send(()); true
+            let _ = shutdown_tx.send(());
+            true
         }
         "/stop" => {
             info!("🛑 收到 /stop 命令, 正常关闭...");
             exit_code.store(0, Ordering::Relaxed);
-            let _ = shutdown_tx.send(()); true
+            let _ = shutdown_tx.send(());
+            true
         }
         "/status" => {
             let status = wechat.check_status().await;
             let listen_list = wechat.get_listen_list().await;
             let db_status = if db.is_some() { "可用" } else { "不可用" };
-            let contacts = if let Some(ref d) = db { d.get_contacts().await.len() } else { 0 };
+            let contacts = if let Some(ref d) = db {
+                d.get_contacts().await.len()
+            } else {
+                0
+            };
             info!("📊 === 运行时状态 ===");
             info!("📊 微信状态: {}", status);
             info!("📊 数据库: {} | 联系人: {} 条", db_status, contacts);
             info!("📊 监听窗口: {} 个 {:?}", listen_list.len(), listen_list);
             info!("📊 版本: v{}", env!("CARGO_PKG_VERSION"));
-            info!("📊 =================="); false
+            info!("📊 ==================");
+            false
         }
         "/refresh" => {
             if let Some(ref d) = db {
@@ -664,7 +728,9 @@ async fn handle_command(
                     Ok(n) => info!("👥 刷新完成: {} 条", n),
                     Err(e) => warn!("⚠️ 刷新失败: {}", e),
                 }
-            } else { info!("⚠️ 数据库不可用"); }
+            } else {
+                info!("⚠️ 数据库不可用");
+            }
             false
         }
         "/help" => {
@@ -673,9 +739,13 @@ async fn handle_command(
             info!("💡 /status   — 运行状态    /refresh — 刷新联系人");
             info!("💡 /help     — 显示帮助");
             info!("💡 快捷键: ↑↓历史 ←→光标 Ctrl+U清行 Ctrl+L清屏");
-            info!("💡 =================="); false
+            info!("💡 ==================");
+            false
         }
-        _ => { info!("❓ 未知命令: {} (/help 查看帮助)", cmd); false }
+        _ => {
+            info!("❓ 未知命令: {} (/help 查看帮助)", cmd);
+            false
+        }
     }
 }
 
@@ -707,7 +777,9 @@ async fn console_loop(
     let mut buf = [0u8; 128];
     loop {
         let n = match stdin.read(&mut buf).await {
-            Ok(0) => break, Ok(n) => n, Err(_) => break,
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
         };
 
         let bytes = &buf[..n];
@@ -717,89 +789,173 @@ async fn console_loop(
 
         while i < bytes.len() {
             match bytes[i] {
-                b'\r' | b'\n' => { exec = true; i += 1; break; }
-                0x7f | 0x08 => { // Backspace
+                b'\r' | b'\n' => {
+                    exec = true;
+                    i += 1;
+                    break;
+                }
+                0x7f | 0x08 => {
+                    // Backspace
                     if cursor > 0 {
-                        let prev = line[..cursor].char_indices().last().map(|(p,_)|p).unwrap_or(0);
-                        line.drain(prev..cursor); cursor = prev; redraw = true;
+                        let prev = line[..cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(p, _)| p)
+                            .unwrap_or(0);
+                        line.drain(prev..cursor);
+                        cursor = prev;
+                        redraw = true;
                     }
                     i += 1;
                 }
-                0x1b if i+2 < bytes.len() && bytes[i+1] == b'[' => match bytes[i+2] {
-                    b'A' => { // ↑ 历史
+                0x1b if i + 2 < bytes.len() && bytes[i + 1] == b'[' => match bytes[i + 2] {
+                    b'A' => {
+                        // ↑ 历史
                         if !history.is_empty() && hist_idx > 0 {
-                            hist_idx -= 1; line = history[hist_idx].clone();
-                            cursor = line.len(); redraw = true;
+                            hist_idx -= 1;
+                            line = history[hist_idx].clone();
+                            cursor = line.len();
+                            redraw = true;
                         }
                         i += 3;
                     }
-                    b'B' => { // ↓ 历史
+                    b'B' => {
+                        // ↓ 历史
                         if hist_idx < history.len() {
                             hist_idx += 1;
-                            line = if hist_idx < history.len() { history[hist_idx].clone() } else { String::new() };
-                            cursor = line.len(); redraw = true;
-                        }
-                        i += 3;
-                    }
-                    b'C' => { // →
-                        if cursor < line.len() {
-                            cursor = line[cursor..].char_indices().nth(1).map(|(ci,_)|cursor+ci).unwrap_or(line.len());
+                            line = if hist_idx < history.len() {
+                                history[hist_idx].clone()
+                            } else {
+                                String::new()
+                            };
+                            cursor = line.len();
                             redraw = true;
                         }
                         i += 3;
                     }
-                    b'D' => { // ←
+                    b'C' => {
+                        // →
+                        if cursor < line.len() {
+                            cursor = line[cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(ci, _)| cursor + ci)
+                                .unwrap_or(line.len());
+                            redraw = true;
+                        }
+                        i += 3;
+                    }
+                    b'D' => {
+                        // ←
                         if cursor > 0 {
-                            cursor = line[..cursor].char_indices().last().map(|(p,_)|p).unwrap_or(0);
+                            cursor = line[..cursor]
+                                .char_indices()
+                                .last()
+                                .map(|(p, _)| p)
+                                .unwrap_or(0);
                             redraw = true;
                         }
                         i += 3;
                     }
-                    b'H' => { cursor = 0; redraw = true; i += 3; }
-                    b'F' => { cursor = line.len(); redraw = true; i += 3; }
-                    b'3' if i+3 < bytes.len() && bytes[i+3] == b'~' => { // Delete
+                    b'H' => {
+                        cursor = 0;
+                        redraw = true;
+                        i += 3;
+                    }
+                    b'F' => {
+                        cursor = line.len();
+                        redraw = true;
+                        i += 3;
+                    }
+                    b'3' if i + 3 < bytes.len() && bytes[i + 3] == b'~' => {
+                        // Delete
                         if cursor < line.len() {
-                            let next = line[cursor..].char_indices().nth(1).map(|(ci,_)|cursor+ci).unwrap_or(line.len());
-                            line.drain(cursor..next); redraw = true;
+                            let next = line[cursor..]
+                                .char_indices()
+                                .nth(1)
+                                .map(|(ci, _)| cursor + ci)
+                                .unwrap_or(line.len());
+                            line.drain(cursor..next);
+                            redraw = true;
                         }
                         i += 4;
                     }
-                    _ => { i += 3; }
-                }
-                0x01 => { cursor = 0; redraw = true; i += 1; }                   // Ctrl+A
-                0x05 => { cursor = line.len(); redraw = true; i += 1; }           // Ctrl+E
-                0x15 => { line.clear(); cursor = 0; redraw = true; i += 1; }      // Ctrl+U
-                0x0c => { // Ctrl+L
+                    _ => {
+                        i += 3;
+                    }
+                },
+                0x01 => {
+                    cursor = 0;
+                    redraw = true;
+                    i += 1;
+                } // Ctrl+A
+                0x05 => {
+                    cursor = line.len();
+                    redraw = true;
+                    i += 1;
+                } // Ctrl+E
+                0x15 => {
+                    line.clear();
+                    cursor = 0;
+                    redraw = true;
+                    i += 1;
+                } // Ctrl+U
+                0x0c => {
+                    // Ctrl+L
                     let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\x1b[2J\x1b[H");
-                    redraw = true; i += 1;
+                    redraw = true;
+                    i += 1;
                 }
-                b if b >= 0x20 && b < 0x7f => { // ASCII
-                    line.insert(cursor, b as char); cursor += 1; redraw = true; i += 1;
+                b if b >= 0x20 && b < 0x7f => {
+                    // ASCII
+                    line.insert(cursor, b as char);
+                    cursor += 1;
+                    redraw = true;
+                    i += 1;
                 }
-                b if b >= 0x80 => { // UTF-8
-                    let clen = if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 };
+                b if b >= 0x80 => {
+                    // UTF-8
+                    let clen = if b < 0xE0 {
+                        2
+                    } else if b < 0xF0 {
+                        3
+                    } else {
+                        4
+                    };
                     if i + clen <= bytes.len() {
-                        if let Ok(s) = std::str::from_utf8(&bytes[i..i+clen]) {
-                            line.insert_str(cursor, s); cursor += s.len(); redraw = true;
+                        if let Ok(s) = std::str::from_utf8(&bytes[i..i + clen]) {
+                            line.insert_str(cursor, s);
+                            cursor += s.len();
+                            redraw = true;
                         }
                     }
                     i += clen;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
-        if redraw && !exec { redraw_prompt(&line, cursor); }
+        if redraw && !exec {
+            redraw_prompt(&line, cursor);
+        }
 
         if exec {
             let cmd = line.trim().to_string();
             let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\r\n");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             if !cmd.is_empty() {
-                if history.last().map(|h| h != &cmd).unwrap_or(true) { history.push(cmd.clone()); }
-                if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db).await { return; }
+                if history.last().map(|h| h != &cmd).unwrap_or(true) {
+                    history.push(cmd.clone());
+                }
+                if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db).await {
+                    return;
+                }
             }
-            line.clear(); cursor = 0; hist_idx = history.len();
+            line.clear();
+            cursor = 0;
+            hist_idx = history.len();
             redraw_prompt(&line, cursor);
         }
     }
@@ -822,13 +978,12 @@ async fn console_loop_simple(
             Ok(_) => {
                 let cmd = line.trim().to_string();
                 if !cmd.is_empty() {
-                    if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db).await { break; }
+                    if handle_command(&cmd, &exit_code, &shutdown_tx, &wechat, &db).await {
+                        break;
+                    }
                 }
             }
             Err(_) => break,
         }
     }
 }
-
-
-

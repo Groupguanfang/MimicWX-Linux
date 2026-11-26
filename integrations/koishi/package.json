@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-mimicwx-onebot",
   "type": "module",
-  "version": "1.0.1",
+  "version": "1.0.4",
   "private": true,
   "description": "MimicWX OneBot 11 adapter preserving existing WeChat identities",
   "license": "MIT",

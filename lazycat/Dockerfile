@@ -12,6 +12,9 @@ RUN curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rust
     | sh -s -- -y --default-toolchain "${RUST_TOOLCHAIN}" --profile minimal
 ENV PATH="/root/.cargo/bin:${PATH}"
 
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -52,7 +55,8 @@ RUN printf '%s  /tmp/wechat.deb\n' "${WECHAT_SHA256}" | sha256sum --check - \
     && rm -rf /var/lib/apt/lists/*
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libegl1 libgl1 libegl-mesa0 libpulse0 \
+    ffmpeg libasound2-plugins libegl1 libgl1 libegl-mesa0 libpulse0 \
+    pulseaudio pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/mimicwx /usr/local/bin/mimicwx

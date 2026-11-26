@@ -16,6 +16,8 @@ tokio = { version = "1", features = ["full"] }
 
 # HTTP/WebSocket API
 axum = { version = "0.8", features = ["ws"] }
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 
@@ -34,6 +36,9 @@ quick-xml = "0.37"
 zstd = "0.13"
 toml = "0.8"
 base64 = "0.22"
+aes = "0.8"
+cbc = "0.1"
+getrandom = "0.3"
 
 # ================================================================
 # Linux-only dependencies (AT-SPI2, DBus, X11 XTEST)

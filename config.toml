@@ -5,6 +5,10 @@
 # 请求方式: Header "Authorization: Bearer <token>" 或 Query "?token=<token>"
 token = ""
 
+[typing]
+enabled = true
+max_chars = 40
+
 [listen]
 # 启动后自动弹出独立窗口并监听的对象
 # 填入联系人名称或群名称 (与微信显示名一致)
@@ -16,3 +20,9 @@ auto = []
 enabled = true
 # 留空时复用 [api].token
 token = ""
+
+# 反向 WebSocket，可重复配置多个目标。省略时仅启用正向连接。
+# [[onebot.reverse]]
+# url = "ws://127.0.0.1:6199/ws"
+# token = ""
+# numeric_ids = true

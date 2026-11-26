@@ -7,19 +7,26 @@
 //! - 发送消息: 定位输入框 → 聚焦 → 粘贴验证 → 发送验证
 //! - 独立窗口管理: ChatWnd 弹出/监听/关闭
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::atspi::{AtSpi, NodeRef, SearchAction, is_structural_role};
+use crate::atspi::{is_structural_role, AtSpi, BBox, NodeRef, SearchAction};
 use crate::chatwnd::ChatWnd;
 use crate::input::InputEngine;
+
+mod mention;
+mod quote;
+mod voice;
+pub(crate) use mention::{rendered_text, TextPart};
+pub use quote::NativeQuoteTarget;
 
 const STATE_EDITABLE: u64 = 1 << 7;
 const STATE_FOCUSED: u64 = 1 << 12;
 const STATE_MODAL: u64 = 1 << 16;
+const STATE_VISIBLE: u64 = 1 << 30;
 const STATE_SHOWING: u64 = 1 << 25;
 
 // =====================================================================
@@ -173,27 +180,38 @@ impl WeChat {
 
     /// 查找导航工具栏 [tool bar] "导航" — 用于判断登录状态
     pub async fn find_nav_toolbar(&self, app: &NodeRef) -> Option<NodeRef> {
-        self.atspi.find_bfs(app, |role, name| {
-            role == "tool bar" && (name.contains("导航") || name.contains("Navigation"))
-        }).await
+        self.atspi
+            .find_bfs(app, |role, name| {
+                role == "tool bar" && (name.contains("导航") || name.contains("Navigation"))
+            })
+            .await
     }
 
     /// 查找 [splitter] — 会话列表和聊天区域的容器
     pub async fn find_split_pane(&self, app: &NodeRef) -> Option<NodeRef> {
-        self.atspi.find_bfs(app, |role, _| {
-            role == "splitter" || role == "split pane"
-        }).await
+        self.atspi
+            .find_bfs(app, |role, _| role == "splitter" || role == "split pane")
+            .await
     }
 
     /// 会话列表 — DFS 查找 [list] name='Chats'
     pub async fn find_session_list(&self, app: &NodeRef) -> Option<NodeRef> {
-        let result = self.atspi.find_dfs(app, &|role, name| {
-            if role == "list" && (name.contains("Chats") || name.contains("会话")) {
-                SearchAction::Found
-            } else {
-                SearchAction::Recurse
-            }
-        }, 0, 18, 20).await;
+        let result = self
+            .atspi
+            .find_dfs(
+                app,
+                &|role, name| {
+                    if role == "list" && (name.contains("Chats") || name.contains("会话")) {
+                        SearchAction::Found
+                    } else {
+                        SearchAction::Recurse
+                    }
+                },
+                0,
+                18,
+                20,
+            )
+            .await;
         if result.is_some() {
             debug!("[find_session_list] 找到会话列表");
         }
@@ -202,13 +220,22 @@ impl WeChat {
 
     /// 消息列表 — DFS 查找 [list] name='Messages'
     pub async fn find_message_list(&self, app: &NodeRef) -> Option<NodeRef> {
-        let result = self.atspi.find_dfs(app, &|role, name| {
-            if role == "list" && (name.contains("Messages") || name.contains("消息")) {
-                SearchAction::Found
-            } else {
-                SearchAction::Recurse
-            }
-        }, 0, 18, 20).await;
+        let result = self
+            .atspi
+            .find_dfs(
+                app,
+                &|role, name| {
+                    if role == "list" && (name.contains("Messages") || name.contains("消息")) {
+                        SearchAction::Found
+                    } else {
+                        SearchAction::Recurse
+                    }
+                },
+                0,
+                18,
+                20,
+            )
+            .await;
         if result.is_some() {
             debug!("[find_message_list] 找到消息列表");
         }
@@ -217,19 +244,29 @@ impl WeChat {
 
     /// 在 app 范围内查找输入框 (role=entry 或 role=text) — DFS 到 depth 18
     pub async fn find_edit_box(&self, app: &NodeRef) -> Option<NodeRef> {
-        self.atspi.find_dfs(app, &|role, _| {
-            if role == "entry" || role == "text" {
-                SearchAction::Found
-            } else {
-                SearchAction::Recurse
-            }
-        }, 0, 18, 20).await
+        self.atspi
+            .find_dfs(
+                app,
+                &|role, _| {
+                    if role == "entry" || role == "text" {
+                        SearchAction::Found
+                    } else {
+                        SearchAction::Recurse
+                    }
+                },
+                0,
+                18,
+                20,
+            )
+            .await
     }
 
     async fn find_chat_edit_box(&self, app: &NodeRef, who: &str) -> Option<NodeRef> {
         let mut pending = vec![(app.clone(), 0u32)];
         let mut visited = 0;
         let mut editor = None;
+        let mut hinted_editor = false;
+        let mut confirmed_header = false;
         while let Some((node, depth)) = pending.pop() {
             visited += 1;
             if visited > 750 {
@@ -237,16 +274,19 @@ impl WeChat {
             }
             let role = self.atspi.role(&node).await;
             let states = self.atspi.get_states(&node).await;
-            if depth > 1 && states & STATE_SHOWING == 0 {
+            if depth > 1 && !state_is_visible(states) {
                 continue;
             }
-            if states & STATE_SHOWING != 0
-                && (role == "dialog" || states & STATE_MODAL != 0)
-            {
+            if state_is_visible(states) && (role == "dialog" || states & STATE_MODAL != 0) {
                 return None;
             }
+            let name = self.atspi.name(&node).await;
+            if role == "label" && name.trim() == who {
+                confirmed_header = true;
+            }
             if role == "entry" || role == "text" {
-                if states & STATE_EDITABLE != 0 && self.atspi.name(&node).await.trim() == who {
+                if states & STATE_EDITABLE != 0 && chat_editor_name_matches(&name, who) {
+                    hinted_editor = name.trim() != who;
                     editor = Some(node);
                 }
                 continue;
@@ -261,14 +301,20 @@ impl WeChat {
                 }
             }
         }
-        editor
+        if hinted_editor && !confirmed_header {
+            None
+        } else {
+            editor
+        }
     }
 
     /// 在会话容器中按名称查找联系人 (BFS 穿透 filler 层级)
     pub async fn find_session(&self, container: &NodeRef, name: &str) -> Option<NodeRef> {
         let mut frontier = vec![container.clone()];
         for _depth in 0..6 {
-            if frontier.is_empty() { return None; }
+            if frontier.is_empty() {
+                return None;
+            }
             let mut next = Vec::new();
             for node in &frontier {
                 let count = self.atspi.child_count(node).await;
@@ -276,6 +322,7 @@ impl WeChat {
                     if let Some(child) = self.atspi.child_at(node, i).await {
                         let item_name = self.atspi.name(&child).await;
                         if self.atspi.role(&child).await == "list item"
+                            && state_is_visible(self.atspi.get_states(&child).await)
                             && session_name_matches(&item_name, name)
                         {
                             return Some(child);
@@ -290,6 +337,170 @@ impl WeChat {
             frontier = next;
         }
         None
+    }
+
+    async fn find_session_scrolling(
+        &self,
+        engine: &mut InputEngine,
+        app: &NodeRef,
+        who: &str,
+    ) -> Result<Option<NodeRef>> {
+        let Some(list) = self.find_session_list(app).await else {
+            return Ok(None);
+        };
+        if !state_is_visible(self.atspi.get_states(&list).await) {
+            return Ok(None);
+        }
+        if let Some(item) = self.find_session(&list, who).await {
+            return Ok(Some(item));
+        }
+        let Some(bounds) = self.atspi.bbox(&list).await else {
+            return Ok(None);
+        };
+        let (center_x, center_y) = bounds.center();
+        engine.scroll(center_x, center_y, 32).await?;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+        let mut previous = Vec::new();
+        for _page in 0..32 {
+            tokio::time::sleep(ms(120)).await;
+            let Some(list) = self.find_session_list(app).await else {
+                break;
+            };
+            if let Some(item) = self.find_session(&list, who).await {
+                return Ok(Some(item));
+            }
+            let mut names = Vec::new();
+            for index in 0..self.atspi.child_count(&list).await.min(50) {
+                if let Some(child) = self.atspi.child_at(&list, index).await {
+                    names.push(
+                        self.atspi
+                            .name(&child)
+                            .await
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_string(),
+                    );
+                }
+            }
+            if names.is_empty() || names == previous || tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            previous = names;
+            engine.scroll(center_x, center_y, -6).await?;
+        }
+        Ok(None)
+    }
+
+    async fn find_visible_search_result(&self, app: &NodeRef, who: &str) -> Option<NodeRef> {
+        let mut pending = vec![(app.clone(), 0u32)];
+        let mut visited = 0;
+        let mut result = None;
+        while let Some((node, depth)) = pending.pop() {
+            visited += 1;
+            if visited > 750 {
+                return None;
+            }
+            let states = self.atspi.get_states(&node).await;
+            if depth > 1 && !state_is_visible(states) {
+                continue;
+            }
+            let role = self.atspi.role(&node).await;
+            let name = self.atspi.name(&node).await;
+            if session_search_result_matches(&role, states, &name, who) {
+                if result.is_some() {
+                    return None;
+                }
+                result = Some(node);
+                continue;
+            }
+            if depth >= 32 || role == "list" && (name.contains("消息") || name.contains("Messages"))
+            {
+                continue;
+            }
+            for index in (0..self.atspi.child_count(&node).await.min(50)).rev() {
+                if let Some(child) = self.atspi.child_at(&node, index).await {
+                    pending.push((child, depth + 1));
+                }
+            }
+        }
+        result
+    }
+
+    async fn restore_session_navigation(
+        &self,
+        engine: &mut InputEngine,
+        app: &NodeRef,
+    ) -> Result<()> {
+        for attempt in 0..3 {
+            if self.find_chat_edit_box(app, "搜索").await.is_some()
+                || self.find_chat_edit_box(app, "Search").await.is_some()
+            {
+                return Ok(());
+            }
+            if attempt == 0
+                && self
+                    .visible_control(app, |role, name| {
+                        role == "label" && name == "Linux 微信已被锁定"
+                    })
+                    .await
+                    .is_some()
+            {
+                bail!("远端 Linux 微信已锁定，请先解锁");
+            }
+            if self
+                .visible_control(app, |role, _| role == "dialog")
+                .await
+                .is_some()
+            {
+                anyhow::bail!("微信存在可见弹窗，已取消切换会话");
+            }
+            let button = self
+                .visible_control(app, |role, name| {
+                    role == "push button" && matches!(name, "返回" | "Back")
+                })
+                .await;
+            let button = match button {
+                Some(button) => Some(button),
+                None if attempt < 2 => {
+                    self.visible_control(app, |role, name| {
+                        role == "push button" && matches!(name, "微信" | "WeChat" | "Chats")
+                    })
+                    .await
+                }
+                None => None,
+            };
+            let Some(button) = button else {
+                break;
+            };
+            let Some(bounds) = self.atspi.bbox(&button).await else {
+                break;
+            };
+            let (center_x, center_y) = bounds.center();
+            info!("💬 恢复会话导航: {}", self.atspi.name(&button).await);
+            engine.click(center_x, center_y).await?;
+            tokio::time::sleep(ms(200)).await;
+        }
+        if self.find_chat_edit_box(app, "搜索").await.is_some()
+            || self.find_chat_edit_box(app, "Search").await.is_some()
+        {
+            return Ok(());
+        }
+        anyhow::bail!("无法恢复可见的会话列表和搜索框");
+    }
+
+    async fn clear_session_search(&self, app: &NodeRef, search: &NodeRef) -> Result<()> {
+        *self.current_chat.lock().await = None;
+        self.atspi.ensure_no_logout_dialog(app).await?;
+        if self.atspi.text(search).await.as_deref() == Some("") {
+            return Ok(());
+        }
+        if self.atspi.set_text(search, "").await
+            && self.atspi.text(search).await.as_deref() == Some("")
+        {
+            return Ok(());
+        }
+        bail!("无法确认微信搜索框已清空，已停止切换会话");
     }
 
     // =================================================================
@@ -316,7 +527,10 @@ impl WeChat {
                 let trimmed = name.trim().to_string();
                 if trimmed.len() > 1 {
                     let has_new = self.check_session_has_new(&child).await;
-                    sessions.push(SessionInfo { name: trimmed, has_new });
+                    sessions.push(SessionInfo {
+                        name: trimmed,
+                        has_new,
+                    });
                 }
             }
         }
@@ -385,18 +599,26 @@ impl WeChat {
     /// 切换到指定聊天 (借鉴 wxauto ChatWith)
     ///
     /// 逻辑: 检查是否已在目标聊天 → 在会话列表找 → 找不到则 Ctrl+F 搜索
-    pub async fn chat_with(
-        &self,
-        engine: &mut InputEngine,
-        who: &str,
-    ) -> Result<Option<String>> {
+    pub async fn chat_with(&self, engine: &mut InputEngine, who: &str) -> Result<Option<String>> {
         info!("💬 ChatWith: {who}");
 
-        // 先聚焦主窗口 (独立窗口可能遮挡)
-        self.focus_main_window(engine).await;
+        if !engine.rectangle_on_screen(0, 0, 800, 600)?
+            && tokio::process::Command::new("xrandr")
+                .args(["--output", "VNC-0", "--mode", "1280x800"])
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success())
+        {
+            info!("💬 已恢复 VNC 桌面分辨率至 1280×800");
+            tokio::time::sleep(ms(250)).await;
+        }
 
-        let app = self.find_app().await
+        let app = self
+            .find_app()
+            .await
             .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
+        self.atspi.ensure_no_logout_dialog(&app).await?;
+        self.focus_main_window(engine).await;
 
         if let Some(editor) = self.find_chat_edit_box(&app, who).await {
             if !self.atspi.grab_focus(&editor).await {
@@ -406,21 +628,40 @@ impl WeChat {
             return Ok(Some(who.to_string()));
         }
 
-        // 1. 尝试在会话列表中直接定位
-        if let Some(list) = self.find_session_list(&app).await {
-            if let Some(item) = self.find_session(&list, who).await {
-                if let Some(bbox) = self.atspi.bbox(&item).await {
-                    let (cx, cy) = bbox.center();
-                    info!("💬 会话列表找到 [{who}], 点击 ({cx}, {cy})");
-                    engine.click(cx, cy).await?;
-                    tokio::time::sleep(ms(500)).await;
-                    let editor = self.find_chat_edit_box(&app, who).await
-                        .ok_or_else(|| anyhow::anyhow!("切换后无法确认目标会话: {who}"))?;
-                    if !self.atspi.grab_focus(&editor).await {
-                        anyhow::bail!("无法聚焦目标会话输入框: {who}");
+        self.restore_session_navigation(engine, &app).await?;
+
+        if let Some(item) = self.find_session_scrolling(engine, &app, who).await? {
+            let item_bounds = self.atspi.bbox(&item).await;
+            let list_bounds = match self.find_session_list(&app).await {
+                Some(list) => self.atspi.bbox(&list).await,
+                None => None,
+            };
+            if let Some((item_bounds, list_bounds)) = item_bounds.zip(list_bounds) {
+                let (center_x, center_y) = item_bounds.center();
+                if session_item_center_within_list(item_bounds, list_bounds)
+                    && engine.rectangle_on_screen(
+                        item_bounds.x,
+                        item_bounds.y,
+                        item_bounds.w,
+                        item_bounds.h,
+                    )?
+                {
+                    info!("💬 会话列表找到 [{who}], 点击 ({center_x}, {center_y})");
+                    engine.click(center_x, center_y).await?;
+                    for _ in 0..8 {
+                        if let Some(editor) = self.find_chat_edit_box(&app, who).await {
+                            if !self.atspi.grab_focus(&editor).await {
+                                anyhow::bail!("无法聚焦目标会话输入框: {who}");
+                            }
+                            *self.current_chat.lock().await = Some(who.to_string());
+                            return Ok(Some(who.to_string()));
+                        }
+                        tokio::time::sleep(ms(250)).await;
                     }
-                    *self.current_chat.lock().await = Some(who.to_string());
-                    return Ok(Some(who.to_string()));
+                    info!("💬 列表点击后未确认目标会话 [{who}]，改用搜索");
+                    self.restore_session_navigation(engine, &app).await?;
+                } else {
+                    info!("💬 跳过坐标不在会话列表内的同名项 [{who}] ({center_x}, {center_y})");
                 }
             }
         }
@@ -428,9 +669,27 @@ impl WeChat {
         // 2. 搜索回退 (借鉴 wxauto Ctrl+F 搜索)
         info!("💬 列表未找到 [{who}], 进入搜索模式");
 
-        // Ctrl+F 打开搜索
-        engine.key_combo("ctrl+f").await?;
-        tokio::time::sleep(ms(500)).await;
+        let search = match self.find_chat_edit_box(&app, "搜索").await {
+            Some(search) => search,
+            None => self
+                .find_chat_edit_box(&app, "Search")
+                .await
+                .ok_or_else(|| anyhow::anyhow!("找不到可见的会话搜索框，已取消切换: {who}"))?,
+        };
+        let bounds = self
+            .atspi
+            .bbox(&search)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("无法读取会话搜索框位置: {who}"))?;
+        anyhow::ensure!(
+            engine.rectangle_on_screen(bounds.x, bounds.y, bounds.w, bounds.h)?,
+            "会话搜索框不在屏幕范围内: {who}"
+        );
+        let (center_x, center_y) = bounds.center();
+        engine.click(center_x, center_y).await?;
+        if !self.atspi.grab_focus(&search).await {
+            anyhow::bail!("无法聚焦会话搜索框: {who}");
+        }
 
         // 清除可能的旧搜索内容
         engine.key_combo("ctrl+a").await?;
@@ -438,14 +697,41 @@ impl WeChat {
 
         // 粘贴搜索关键词
         engine.paste_text(who).await?;
-        tokio::time::sleep(ms(1500)).await;
+        tokio::time::sleep(ms(300)).await;
+        if self.atspi.text(&search).await.as_deref().map(str::trim) != Some(who) {
+            self.clear_session_search(&app, &search).await?;
+            anyhow::bail!("未确认会话搜索关键词，已取消切换: {who}");
+        }
+        let mut selected = false;
+        for _attempt in 0..6 {
+            if let Some(item) = self.find_visible_search_result(&app, who).await {
+                if let Some(bounds) = self.atspi.bbox(&item).await {
+                    if engine.rectangle_on_screen(bounds.x, bounds.y, bounds.w, bounds.h)? {
+                        let (center_x, center_y) = bounds.center();
+                        engine.click(center_x, center_y).await?;
+                        selected = true;
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(ms(300)).await;
+        }
+        if !selected {
+            self.clear_session_search(&app, &search).await?;
+            return Ok(None);
+        }
+        tokio::time::sleep(ms(500)).await;
 
-        // 选择第一个搜索结果 (Enter)
-        engine.press_enter().await?;
-        tokio::time::sleep(ms(800)).await;
-
-        // 验证是否切换成功
-        if let Some(editor) = self.find_chat_edit_box(&app, who).await {
+        // 验证是否切换成功。搜索结果的点击有时要等会话面板完成重绘。
+        let mut editor = None;
+        for _ in 0..10 {
+            editor = self.find_chat_edit_box(&app, who).await;
+            if editor.is_some() {
+                break;
+            }
+            tokio::time::sleep(ms(250)).await;
+        }
+        if let Some(editor) = editor {
             if !self.atspi.grab_focus(&editor).await {
                 anyhow::bail!("无法聚焦目标会话输入框: {who}");
             }
@@ -469,14 +755,12 @@ impl WeChat {
     /// 添加监听目标 — 弹出独立窗口
     ///
     /// 流程: ChatWith 切换 → 双击弹出独立窗口 → 在 Registry 中查找新窗口
-    pub async fn add_listen(
-        &self,
-        engine: &mut InputEngine,
-        who: &str,
-    ) -> Result<bool> {
+    pub async fn add_listen(&self, engine: &mut InputEngine, who: &str) -> Result<bool> {
         info!("👂 添加监听: {who}");
 
-        let app = self.find_app().await
+        let app = self
+            .find_app()
+            .await
             .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
 
         // 1. 先检查是否已有记录
@@ -549,8 +833,8 @@ impl WeChat {
         if windows.remove(who).is_some() {
             info!("👂 移除监听: {who}");
             drop(windows); // 释放锁
-            // X11 原生关闭窗口
-            match engine.close_window_by_title(who) {
+                           // X11 原生关闭窗口
+            match engine.close_window_by_title(who, false) {
                 Ok(true) => info!("👂 已关闭独立窗口: {who}"),
                 Ok(false) => info!("👂 未找到独立窗口 (可能已关闭): {who}"),
                 Err(e) => warn!("👂 X11 关闭窗口失败: {e}"),
@@ -588,7 +872,8 @@ impl WeChat {
         if !collected.is_empty() {
             let mut pending = self.pending_messages.lock().await;
             for (who, new_msgs) in collected {
-                pending.entry(who.clone())
+                pending
+                    .entry(who.clone())
                     .or_insert_with(Vec::new)
                     .extend(new_msgs.clone());
                 result.insert(who, new_msgs);
@@ -746,18 +1031,24 @@ impl WeChat {
         &self,
         engine: &mut InputEngine,
         to: &str,
-        text: &str,
+        parts: &[TextPart],
         skip_verify: bool,
+        quote: Option<&NativeQuoteTarget>,
     ) -> Result<(bool, bool, String)> {
+        let text = rendered_text(parts);
+        let has_mentions = parts
+            .iter()
+            .any(|part| matches!(part, TextPart::Mention { .. }));
         info!("📤 开始发送: [{to}] → {text}");
+        let app = self.find_app().await.context("找不到微信应用")?;
 
         // 检查是否有独立窗口可用
-        {
+        if quote.is_none() && !has_mentions {
             let mut windows = self.listen_windows.lock().await;
             if let Some(chatwnd) = windows.get_mut(to) {
                 if chatwnd.is_alive().await {
                     info!("📤 使用独立窗口发送: {to}");
-                    return chatwnd.send_message(engine, text, skip_verify).await;
+                    return chatwnd.send_message(engine, &app, &text, skip_verify).await;
                 } else {
                     info!("📤 独立窗口已失效, 移除: {to}");
                     windows.remove(to);
@@ -768,10 +1059,6 @@ impl WeChat {
             }
         }
 
-        // 主窗口发送
-        let app = self.find_app().await
-            .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
-
         // 1. 切换到目标聊天
         //    chat_with 内部会在需要切换时先聚焦主窗口
         //    缓存命中时直接跳过, 不破坏已有的输入框焦点
@@ -780,47 +1067,238 @@ impl WeChat {
             return Ok((false, false, format!("未找到聊天: {to}")));
         }
 
-        // 2. 等待 WeChat 聚焦输入框
-        tokio::time::sleep(ms(300)).await;
-
-        let editor = self.find_chat_edit_box(&app, to).await
-            .ok_or_else(|| anyhow::anyhow!("发送前目标会话已改变: {to}"))?;
-        if !self.atspi.grab_focus(&editor).await {
-            anyhow::bail!("无法聚焦目标会话输入框: {to}");
+        let window = self.main_chat_window(&app).await?;
+        self.prepare_empty_composer(engine, &app, &window, to)
+            .await?;
+        if let Some(target) = quote {
+            if let Err(error) = self
+                .prepare_native_quote(engine, &app, &window, to, target)
+                .await
+            {
+                if self.find_chat_edit_box(&window, to).await.is_some() {
+                    if let Err(cleanup) =
+                        self.atspi.clear_quote_composer(engine, &app, &window).await
+                    {
+                        warn!(error = %cleanup, "未能清除失败请求留下的微信引用");
+                    }
+                }
+                return Err(error);
+            }
         }
-        if !self.atspi.text(&editor).await
-            .map(|contents| contents.trim_end_matches('\n').is_empty())
-            .unwrap_or(false)
-        {
-            anyhow::bail!("目标会话输入框已有草稿或无法读取，已取消发送: {to}");
-        }
 
-        // 3. 粘贴消息 (xclip + Ctrl+V)
-        engine.paste_text(text).await?;
-        tokio::time::sleep(ms(300)).await;
-
-        let editor = self.find_chat_edit_box(&app, to).await
-            .ok_or_else(|| anyhow::anyhow!("粘贴后目标会话改变或出现弹窗，已取消发送: {to}"))?;
-        let contents = self.atspi.text(&editor).await;
-        if !message_input_ready(self.atspi.get_states(&editor).await, contents.as_deref(), text) {
-            anyhow::bail!("未确认目标输入框的焦点及完整内容，已取消发送: {to}");
+        if has_mentions {
+            self.input_with_mentions(engine, &app, &window, to, parts, quote)
+                .await?;
+        } else {
+            if !self
+                .input_message_with_recovery(engine, &app, &window, to, &text, quote)
+                .await?
+            {
+                anyhow::bail!("未确认目标输入框的完整内容，已取消发送: {to}");
+            }
+            if let Some(target) = quote {
+                if !self.native_quote_ready(&window, target).await {
+                    anyhow::bail!("发送前微信原生引用框已改变，已取消发送: {to}");
+                }
+            } else {
+                self.atspi.ensure_unquoted_composer(&window).await?;
+            }
+            self.atspi.ensure_no_logout_dialog(&app).await?;
         }
 
         // 4. Enter 发送
         engine.press_enter().await?;
-        tokio::time::sleep(ms(500)).await;
+        if !self.wait_for_message_input(&window, to, "").await {
+            anyhow::bail!("已按发送但未确认目标输入框清空，请检查实际发送结果，勿重复发送: {to}");
+        }
 
         // 5. 验证 (可跳过, 由 API 层 DB 验证替代)
         let verified = if skip_verify {
             debug!("⏩ 跳过 AT-SPI 验证 (将由 DB 验证): [{to}]");
             false
         } else {
-            self.verify_sent(&app, text).await
+            self.verify_sent(&window, &text).await
         };
 
-        let msg = if verified { "消息已发送" } else { "消息已发送 (未验证)" };
+        let msg = if verified {
+            "消息已发送"
+        } else {
+            "消息已发送 (未验证)"
+        };
         info!("✅ 完成: [{to}] verified={verified}");
         Ok((true, verified, msg.into()))
+    }
+
+    async fn input_message_with_recovery(
+        &self,
+        engine: &mut InputEngine,
+        app: &NodeRef,
+        window: &NodeRef,
+        to: &str,
+        text: &str,
+        quote: Option<&NativeQuoteTarget>,
+    ) -> Result<bool> {
+        let input_result = if text.contains('@') {
+            let editor = self
+                .find_chat_edit_box(window, to)
+                .await
+                .context("输入普通 @ 文字前目标会话已改变")?;
+            self.atspi
+                .input_literal_at_text(engine, &editor, text)
+                .await
+        } else {
+            engine.input_message_text(text).await
+        };
+        if input_result.is_ok() && self.wait_for_message_input(window, to, text).await {
+            return Ok(true);
+        }
+        if let Err(error) = input_result {
+            warn!(error = %error, "⌨️ 首次输入未完成，尝试清理本次残稿后用粘贴重试");
+        }
+        if !self
+            .clear_partial_draft(engine, app, window, to, text, quote.is_some())
+            .await?
+        {
+            return Ok(false);
+        }
+        self.prepare_empty_composer(engine, app, window, to).await?;
+        if let Some(target) = quote {
+            self.prepare_native_quote(engine, app, window, to, target)
+                .await?;
+        }
+        engine.paste_text(text).await?;
+        if text.contains('@') {
+            engine.dismiss_wechat_member_popup().await?;
+        }
+        if self.wait_for_message_input(window, to, text).await {
+            return Ok(true);
+        }
+        let _ = self
+            .clear_partial_draft(engine, app, window, to, text, quote.is_some())
+            .await;
+        Ok(false)
+    }
+
+    /// 只清理能确认属于本次输入尝试的残稿，绝不覆盖用户或上一条消息留下的内容。
+    async fn clear_partial_draft(
+        &self,
+        engine: &mut InputEngine,
+        app: &NodeRef,
+        window: &NodeRef,
+        to: &str,
+        expected: &str,
+        has_quote: bool,
+    ) -> Result<bool> {
+        let Some(editor) = self.find_chat_edit_box(window, to).await else {
+            return Ok(false);
+        };
+        let Some(contents) = self.atspi.text(&editor).await else {
+            return Ok(false);
+        };
+        let actual = contents.replace("\r\n", "\n");
+        let expected = expected.replace("\r\n", "\n");
+        let actual_trimmed = actual.trim_end_matches('\n');
+        let expected_trimmed = expected.trim_end_matches('\n');
+        let empty = actual_trimmed.trim().is_empty();
+        let exact = actual_trimmed == expected_trimmed;
+        let partial = !empty && expected_trimmed.starts_with(actual_trimmed);
+        if !empty && !exact && !partial {
+            warn!(
+                draft = %draft_excerpt(&actual),
+                "⌨️ 输入框内容不是本次发送的残稿，保留草稿并停止发送"
+            );
+            return Ok(false);
+        }
+        if !empty {
+            let cleared = self.atspi.set_text(&editor, "").await
+                && self
+                    .atspi
+                    .text(&editor)
+                    .await
+                    .is_some_and(|contents| contents.trim().is_empty());
+            if !cleared {
+                if !self.atspi.grab_focus(&editor).await
+                    || self.atspi.get_states(&editor).await & STATE_FOCUSED == 0
+                {
+                    return Ok(false);
+                }
+                engine.key_combo("ctrl+a").await?;
+                engine.press_key("BackSpace").await?;
+            }
+        }
+        if has_quote {
+            let _ = self.atspi.clear_quote_composer(engine, app, window).await?;
+        }
+        let Some(editor) = self.find_chat_edit_box(window, to).await else {
+            return Ok(false);
+        };
+        Ok(self.atspi.grab_focus(&editor).await
+            && self.wait_for_message_input(window, to, "").await)
+    }
+
+    async fn main_chat_window(&self, app: &NodeRef) -> Result<NodeRef> {
+        self.visible_control(app, |role, name| role == "frame" && is_wechat_main(name))
+            .await
+            .context("找不到可见的微信主窗口")
+    }
+
+    async fn prepare_empty_composer(
+        &self,
+        engine: &mut InputEngine,
+        app: &NodeRef,
+        window: &NodeRef,
+        to: &str,
+    ) -> Result<()> {
+        let editor = self
+            .find_chat_edit_box(window, to)
+            .await
+            .with_context(|| format!("发送前目标会话已改变: {to}"))?;
+        let contents = self.atspi.text(&editor).await;
+        if !contents
+            .as_deref()
+            .is_some_and(|contents| contents.trim().is_empty())
+        {
+            bail!(
+                "目标会话输入框已有草稿或无法读取，已取消发送: {to}（草稿：{}）",
+                draft_excerpt(contents.as_deref().unwrap_or("<无法读取>"))
+            );
+        }
+        let editor = if self.atspi.clear_quote_composer(engine, app, window).await? {
+            self.find_chat_edit_box(window, to)
+                .await
+                .with_context(|| format!("清理引用后目标会话已改变: {to}"))?
+        } else {
+            editor
+        };
+        if !self.atspi.grab_focus(&editor).await
+            || !self.wait_for_message_input(window, to, "").await
+        {
+            bail!("无法确认目标会话输入框已聚焦且为空: {to}");
+        }
+        Ok(())
+    }
+
+    async fn wait_for_message_input(&self, window: &NodeRef, to: &str, expected: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + ms(1500);
+        loop {
+            let Some(editor) = self.find_chat_edit_box(window, to).await else {
+                return false;
+            };
+            let contents = self.atspi.text(&editor).await;
+            let states = self.atspi.get_states(&editor).await;
+            let ready = if expected.is_empty() {
+                empty_input_ready(states, contents.as_deref())
+            } else {
+                message_input_ready(states, contents.as_deref(), expected)
+            };
+            if ready {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(ms(40)).await;
+        }
     }
 
     /// 发送图片 (优先独立窗口, 回退主窗口)
@@ -829,8 +1307,11 @@ impl WeChat {
         engine: &mut InputEngine,
         to: &str,
         image_path: &str,
+        sticker: bool,
     ) -> Result<(bool, bool, String)> {
-        info!("🖼️ 开始发送图片: [{to}] → {image_path}");
+        let media_type = if sticker { "原生表情" } else { "图片" };
+        info!("🖼️ 开始发送{media_type}: [{to}] → {image_path}");
+        let app = self.find_app().await.context("找不到微信应用")?;
 
         // 检查是否有独立窗口可用
         {
@@ -838,7 +1319,7 @@ impl WeChat {
             if let Some(chatwnd) = windows.get_mut(to) {
                 if chatwnd.is_alive().await {
                     info!("🖼️ 使用独立窗口发送图片: {to}");
-                    return chatwnd.send_image(engine, image_path).await;
+                    return chatwnd.send_image(engine, &app, image_path, sticker).await;
                 } else {
                     info!("🖼️ 独立窗口已失效, 移除: {to}");
                     windows.remove(to);
@@ -858,33 +1339,33 @@ impl WeChat {
 
         tokio::time::sleep(ms(300)).await;
 
-        let app = self.find_app().await
-            .ok_or_else(|| anyhow::anyhow!("找不到微信应用"))?;
-        let editor = self.find_chat_edit_box(&app, to).await
-            .ok_or_else(|| anyhow::anyhow!("发送图片前目标会话已改变: {to}"))?;
-        if !self.atspi.grab_focus(&editor).await {
-            anyhow::bail!("无法聚焦目标会话输入框: {to}");
-        }
-        let contents = self.atspi.text(&editor).await;
-        if !empty_input_ready(self.atspi.get_states(&editor).await, contents.as_deref()) {
-            anyhow::bail!("目标会话输入框已有草稿或无法读取，已取消发送图片: {to}");
-        }
+        let window = self.main_chat_window(&app).await?;
+        self.prepare_empty_composer(engine, &app, &window, to)
+            .await?;
 
         // 粘贴图片
-        engine.paste_image(image_path).await?;
+        if sticker {
+            engine.paste_sticker(image_path).await?;
+        } else {
+            engine.paste_image(image_path).await?;
+        }
         tokio::time::sleep(ms(500)).await;
 
-        let editor = self.find_chat_edit_box(&app, to).await
+        let editor = self
+            .find_chat_edit_box(&window, to)
+            .await
             .ok_or_else(|| anyhow::anyhow!("粘贴图片后目标会话改变或出现弹窗，已取消发送: {to}"))?;
         if !self.atspi.grab_focus(&editor).await {
             anyhow::bail!("粘贴图片后无法聚焦目标会话输入框: {to}");
         }
+        self.atspi.ensure_unquoted_composer(&window).await?;
+        self.atspi.ensure_no_logout_dialog(&app).await?;
 
         // Enter 发送
         engine.press_enter().await?;
 
-        info!("✅ 图片发送完成: [{to}]");
-        Ok((true, false, "图片已发送".into()))
+        info!("✅ {media_type}发送完成: [{to}]");
+        Ok((true, false, format!("{media_type}已发送")))
     }
 
     /// 验证消息是否出现在消息列表末尾 (检查最后几条)
@@ -911,7 +1392,39 @@ fn session_name_matches(item_name: &str, target: &str) -> bool {
     item_name.lines().next().map(str::trim) == Some(target)
 }
 
-fn message_input_ready(states: u64, contents: Option<&str>, expected: &str) -> bool {
+fn session_item_center_within_list(item: BBox, list: BBox) -> bool {
+    let (center_x, center_y) = item.center();
+    item.w > 0
+        && item.h > 0
+        && (list.x..list.x + list.w).contains(&center_x)
+        && (list.y..list.y + list.h).contains(&center_y)
+}
+
+fn state_is_visible(states: u64) -> bool {
+    states & (STATE_SHOWING | STATE_VISIBLE) != 0
+}
+
+fn chat_editor_name_matches(name: &str, target: &str) -> bool {
+    let name = name.trim();
+    !target.is_empty()
+        && (name == target
+            || name.strip_suffix(" 按住 Ctrl + Super 使用语音输入文字") == Some(target))
+}
+
+fn draft_excerpt(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\n', " ");
+    let mut excerpt: String = normalized.trim().chars().take(40).collect();
+    if normalized.trim().chars().count() > 40 {
+        excerpt.push('…');
+    }
+    excerpt
+}
+
+fn session_search_result_matches(role: &str, states: u64, name: &str, target: &str) -> bool {
+    role == "list item" && state_is_visible(states) && session_name_matches(name, target)
+}
+
+pub(crate) fn message_input_ready(states: u64, contents: Option<&str>, expected: &str) -> bool {
     let required = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
     let Some(contents) = contents else {
         return false;
@@ -925,25 +1438,121 @@ fn message_input_ready(states: u64, contents: Option<&str>, expected: &str) -> b
 
 pub(crate) fn empty_input_ready(states: u64, contents: Option<&str>) -> bool {
     let required = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
-    states & required == required
-        && contents.is_some_and(|contents| contents.trim().is_empty())
+    states & required == required && contents.is_some_and(|contents| contents.trim().is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        empty_input_ready, message_input_ready, session_name_matches, STATE_EDITABLE, STATE_FOCUSED,
-        STATE_SHOWING,
+        chat_editor_name_matches, draft_excerpt, empty_input_ready, message_input_ready,
+        session_item_center_within_list, session_name_matches, session_search_result_matches,
+        state_is_visible, BBox, STATE_EDITABLE, STATE_FOCUSED, STATE_SHOWING, STATE_VISIBLE,
     };
+
+    #[test]
+    fn session_click_requires_center_inside_sidebar() {
+        let list = BBox {
+            x: 55,
+            y: 70,
+            w: 85,
+            h: 760,
+        };
+        let row = BBox {
+            x: 58,
+            y: 385,
+            w: 80,
+            h: 42,
+        };
+        assert!(session_item_center_within_list(row, list));
+        assert!(!session_item_center_within_list(
+            BBox { x: 340, ..row },
+            list
+        ));
+        assert!(!session_item_center_within_list(
+            BBox { w: 644, ..row },
+            list
+        ));
+    }
+
+    #[test]
+    fn chat_editor_accepts_only_the_known_voice_hint_suffix() {
+        assert!(chat_editor_name_matches("测试裙", "测试裙"));
+        assert!(chat_editor_name_matches(
+            "测试裙 按住 Ctrl + Super 使用语音输入文字",
+            "测试裙",
+        ));
+        assert!(!chat_editor_name_matches("测试裙备份", "测试裙"));
+        assert!(!chat_editor_name_matches("测试裙 任意提示", "测试裙"));
+        assert!(!chat_editor_name_matches(
+            " 按住 Ctrl + Super 使用语音输入文字",
+            ""
+        ));
+    }
+
+    #[test]
+    fn search_requires_a_visible_exact_session_result() {
+        assert!(session_search_result_matches(
+            "list item",
+            super::STATE_VISIBLE,
+            "舍友\n群聊",
+            "舍友"
+        ));
+        assert!(state_is_visible(STATE_SHOWING));
+        assert!(state_is_visible(STATE_VISIBLE));
+        assert!(!state_is_visible(1 << 22));
+        assert!(!state_is_visible(0));
+        assert!(!session_search_result_matches(
+            "list item",
+            0,
+            "舍友\n群聊",
+            "舍友"
+        ));
+        assert!(!session_search_result_matches(
+            "push button",
+            super::STATE_SHOWING,
+            "舍友",
+            "舍友"
+        ));
+        assert!(!session_search_result_matches(
+            "list item",
+            super::STATE_SHOWING,
+            "搜索网络结果\n舍友",
+            "舍友"
+        ));
+        assert!(!session_search_result_matches(
+            "list item",
+            super::STATE_SHOWING,
+            "舍友备份\n群聊",
+            "舍友"
+        ));
+    }
 
     #[test]
     fn submission_requires_focus_and_the_complete_pasted_message() {
         let ready = STATE_EDITABLE | STATE_FOCUSED | STATE_SHOWING;
-        assert!(message_input_ready(ready, Some("完整内容\n第二行\n"), "完整内容\r\n第二行"));
-        assert!(!message_input_ready(ready, Some("旧草稿完整内容"), "完整内容"));
-        assert!(!message_input_ready(ready & !STATE_FOCUSED, Some("完整内容"), "完整内容"));
+        assert!(message_input_ready(
+            ready,
+            Some("完整内容\n第二行\n"),
+            "完整内容\r\n第二行"
+        ));
+        assert!(!message_input_ready(
+            ready,
+            Some("旧草稿完整内容"),
+            "完整内容"
+        ));
+        assert!(!message_input_ready(
+            ready & !STATE_FOCUSED,
+            Some("完整内容"),
+            "完整内容"
+        ));
         assert!(!message_input_ready(ready, None, "完整内容"));
         assert!(!message_input_ready(ready, Some(""), ""));
+    }
+
+    #[test]
+    fn draft_excerpt_is_short_and_single_line() {
+        assert_eq!(draft_excerpt("第一行\n第二行"), "第一行 第二行");
+        assert_eq!(draft_excerpt(&"字".repeat(50)).chars().count(), 41);
     }
 
     #[test]
@@ -952,7 +1561,10 @@ mod tests {
             "sandbox@chatroom\n沙盒好友: 测试消息\n16:16",
             "沙盒好友",
         ));
-        assert!(session_name_matches("沙盒好友\n测试消息\n16:16", "沙盒好友"));
+        assert!(session_name_matches(
+            "沙盒好友\n测试消息\n16:16",
+            "沙盒好友"
+        ));
         assert!(!session_name_matches("测试裙备份\n测试消息", "测试裙"));
         assert!(session_name_matches("测试裙\n测试消息", "测试裙"));
     }
@@ -1008,9 +1620,7 @@ pub(crate) async fn parse_message_item(atspi: &AtSpi, item: &NodeRef, index: i32
         }
     }
 
-    let (msg_type, sender, content) = classify_message(
-        &name, &children, has_button, &button_name,
-    );
+    let (msg_type, sender, content) = classify_message(&name, &children, has_button, &button_name);
     let msg_id = generate_msg_id(index, &msg_type, &sender, &content);
 
     ChatMessage {
@@ -1073,26 +1683,51 @@ pub(crate) fn generate_msg_id(index: i32, msg_type: &str, sender: &str, content:
 /// 判断文本是否是时间格式 (更严格: 要求冒号前后是数字)
 pub(crate) fn is_time_text(text: &str) -> bool {
     let text = text.trim();
-    if text.len() > 25 || text.is_empty() { return false; }
+    if text.len() > 25 || text.is_empty() {
+        return false;
+    }
     // 数字:数字 格式 (如 "14:30", "下午 2:30", "2026/3/1 14:30")
     if text.contains(':') {
-        let has_digit_colon = text.as_bytes().windows(3).any(|w| {
-            w[0].is_ascii_digit() && w[1] == b':' && w[2].is_ascii_digit()
-        });
-        if has_digit_colon { return true; }
+        let has_digit_colon = text
+            .as_bytes()
+            .windows(3)
+            .any(|w| w[0].is_ascii_digit() && w[1] == b':' && w[2].is_ascii_digit());
+        if has_digit_colon {
+            return true;
+        }
     }
-    if text.contains("昨天") || text.contains("前天") || text.contains("星期") { return true; }
-    if text.contains("年") && text.contains("月") { return true; }
-    let days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Yesterday"];
+    if text.contains("昨天") || text.contains("前天") || text.contains("星期") {
+        return true;
+    }
+    if text.contains("年") && text.contains("月") {
+        return true;
+    }
+    let days = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+        "Yesterday",
+    ];
     days.iter().any(|d| text.contains(d))
 }
 
 /// 公共发送验证: 检查消息列表末尾是否包含指定文本
 ///
 /// 被 WeChat::verify_sent 和 ChatWnd::verify_sent 共用, 消除 copy-paste
-pub(crate) async fn verify_sent_in_list(atspi: &AtSpi, msg_list: &NodeRef, text: &str, attempt: i32) -> bool {
+pub(crate) async fn verify_sent_in_list(
+    atspi: &AtSpi,
+    msg_list: &NodeRef,
+    text: &str,
+    attempt: i32,
+) -> bool {
     let count = atspi.child_count(msg_list).await;
-    if count <= 0 { return false; }
+    if count <= 0 {
+        return false;
+    }
 
     let check_range = 3.min(count);
     for i in (count - check_range)..count {
